@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --color-primary-green: #0D381E;
+    --color-primary-green-dark: #072212;
+    --color-primary-green-light: #16532d;
+    --color-canvas-cream: #F9F8F4;
+    --color-canvas-cream-subtle: #F4F3EE;
+    --color-ink-text: #1A231E;
+    --color-ink-muted: #57655B;
+    --color-accent-gold: #E5C158;
+    --color-accent-gold-light: #F3D273;
+    --color-accent-gold-dark: #B99432;
+    --color-hairline: #E6E2D8;
+    --color-card-surface: #FFFFFF;
+  }
+
+  body {
+    background-color: var(--color-canvas-cream);
+    color: var(--color-ink-text);
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, .font-heading {
+    font-family: 'Cormorant Garamond', Georgia, serif;
+  }
+
+  .font-display {
+    font-family: 'Cinzel', serif;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Subtle Islamic geometric pattern background utility */
+.bg-islamic-pattern {
+  background-color: #0D381E;
+  background-image: radial-gradient(rgba(229, 193, 88, 0.12) 1px, transparent 0),
+                    radial-gradient(rgba(229, 193, 88, 0.08) 1px, #0D381E 1px);
+  background-size: 32px 32px;
+  background-position: 0 0, 16px 16px;
+}
+
+.bg-cream-pattern {
+  background-color: #F9F8F4;
+  background-image: radial-gradient(#E6E2D8 0.75px, transparent 0.75px);
+  background-size: 24px 24px;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F4F3EE;
+}
+::-webkit-scrollbar-thumb {
+  background: #D8D2C5;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #B99432;
+}

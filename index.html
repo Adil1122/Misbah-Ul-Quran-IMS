@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remix Misbah-ul-Quran IMS</title>
+    <meta name="description" content="Multi-campus Institute Management System for Misbah-ul-Quran managing students, teachers, parents, attendance, payments, and academic progress across UK and KTS Pakistan campuses." />
+    <meta property="og:title" content="Remix Misbah-ul-Quran IMS" />
+    <meta property="og:description" content="Multi-campus Institute Management System for Misbah-ul-Quran managing students, teachers, parents, attendance, payments, and academic progress across UK and KTS Pakistan campuses." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;600;700&family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,400;1,600&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <script>
+      // Gracefully handle benign Vite HMR websocket disconnection in cloud proxy environments
+      (function() {
+        var suppress = function(str) {
+          if (!str || typeof str !== 'string') return false;
+          return str.indexOf('WebSocket') !== -1 ||
+                 str.indexOf('websocket') !== -1 ||
+                 str.indexOf('closed without opened') !== -1 ||
+                 str.indexOf('failed to connect to websocket') !== -1;
+        };
+
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event.reason ? (event.reason.message || String(event.reason)) : '';
+          if (suppress(reason)) {
+            event.preventDefault();
+            if (typeof event.stopImmediatePropagation === 'function') {
+              event.stopImmediatePropagation();
+            }
+          }
+        }, true);
+
+        window.addEventListener('error', function(event) {
+          var msg = event.message || (event.error && event.error.message) || '';
+          if (suppress(msg)) {
+            event.preventDefault();
+            if (typeof event.stopImmediatePropagation === 'function') {
+              event.stopImmediatePropagation();
+            }
+          }
+        }, true);
+
+        var origConsoleError = console.error;
+        console.error = function() {
+          var allText = Array.prototype.slice.call(arguments).map(function(arg) {
+            return (arg && arg.message) ? arg.message : String(arg);
+          }).join(' ');
+          if (suppress(allText)) {
+            return;
+          }
+          origConsoleError.apply(console, arguments);
+        };
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

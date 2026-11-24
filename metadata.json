@@ -1,0 +1,8 @@
+{
+  "name": "Remix Misbah-ul-Quran IMS",
+  "description": "Multi-campus Institute Management System for Misbah-ul-Quran managing students, teachers, parents, attendance, payments, and academic progress across UK and KTS Pakistan campuses.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

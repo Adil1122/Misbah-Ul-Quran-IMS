@@ -1,0 +1,402 @@
+// Prisma Schema for Misbah-ul-Quran IMS (MySQL)
+// Normalized multi-campus architecture supporting UK Campus and KTS Pakistan Campus
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Exactly four authenticated roles (Students are managed institutional records, not logins)
+enum UserRole {
+  SUPER_ADMIN
+  CAMPUS_ADMIN
+  TEACHER
+  PARENT
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+enum TeacherAttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  LEAVE
+}
+
+enum PaymentStatus {
+  PAID
+  PARTIAL
+  PENDING
+  OVERDUE
+  CANCELLED
+}
+
+enum ReportStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  REJECTED
+}
+
+// 1. Campus Model (UK Campus, KTS Pakistan Campus)
+model Campus {
+  id                 String                    @id @default(uuid())
+  code               String                    @unique // "UK-01", "KTS-01"
+  name               String                    // "UK Campus", "KTS Pakistan Campus"
+  country            String                    // "United Kingdom", "Pakistan"
+  city               String
+  address            String
+  timezone           String                    // "Europe/London", "Asia/Karachi"
+  currencyCode       String                    // "GBP", "PKR"
+  phone              String
+  email              String
+  isActive           Boolean                   @default(true)
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+  deletedAt          DateTime?
+
+  users              UserCampus[]
+  teachers           Teacher[]
+  students           Student[]
+  classes            Class[]
+  teacherAttendances TeacherAttendanceRecord[]
+  studentAttendances StudentAttendanceRecord[]
+  feeStructures      FeeStructure[]
+  payments           Payment[]
+  announcements      Announcement[]
+  incidents          IncidentReport[]
+  auditLogs          AuditLog[]
+
+  @@map("campuses")
+}
+
+// 2. User Authentication Model
+model User {
+  id            String       @id @default(uuid())
+  email         String       @unique
+  username      String?      @unique
+  passwordHash  String
+  fullName      String
+  phone         String?
+  role          UserRole
+  isActive      Boolean      @default(true)
+  lastLoginAt   DateTime?
+  refreshToken  String?      @db.Text
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  campuses      UserCampus[]
+  teacher       Teacher?
+  parent        Parent?
+  createdAudits AuditLog[]   @relation("UserAudits")
+
+  @@map("users")
+}
+
+// Scoped user-campus relation (Super Admin can be linked to all, Campus Admin locked to one)
+model UserCampus {
+  id        String   @id @default(uuid())
+  userId    String
+  campusId  String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campus    Campus   @relation(fields: [campusId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, campusId])
+  @@map("user_campuses")
+}
+
+// 3. Teacher Profile
+model Teacher {
+  id             String                    @id @default(uuid())
+  userId         String                    @unique
+  user           User                      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  campusId       String
+  campus         Campus                    @relation(fields: [campusId], references: [id])
+  employeeCode   String                    @unique
+  specialization String?                   // "Quran & Tajweed", "Islamic Studies", "Arabic"
+  qualification  String?
+  joinDate       DateTime
+
+  classes        ClassTeacher[]
+  attendances    TeacherAttendanceRecord[]
+  createdLogs    AcademicProgress[]
+  createdReports IncidentReport[]
+
+  @@map("teachers")
+}
+
+// 4. Parent Profile (Family Portal access)
+model Parent {
+  id         String          @id @default(uuid())
+  userId     String          @unique
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cnicOrId   String?         // National ID / Passport
+  occupation String?
+  address    String?
+  students   StudentParent[]
+
+  @@map("parents")
+}
+
+// 5. Student Entity (Database record — not a login user)
+model Student {
+  id              String                    @id @default(uuid())
+  admissionNumber String                    @unique // "MUQ-UK-0001", "MUQ-KTS-0001"
+  campusId        String
+  campus          Campus                    @relation(fields: [campusId], references: [id])
+  firstName       String
+  lastName        String
+  gender          Gender
+  dob             DateTime
+  enrollmentDate  DateTime
+  currentGrade    String                    // "Hifz Level 1", "Nazra Grade 2"
+  bloodGroup      String?
+  medicalNotes    String?
+  isActive        Boolean                   @default(true)
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+  deletedAt       DateTime?
+
+  parents         StudentParent[]
+  classStudents   ClassStudent[]
+  attendance      StudentAttendanceRecord[]
+  academicLogs    AcademicProgress[]
+  payments        Payment[]
+  incidents       IncidentReport[]
+
+  @@map("students")
+}
+
+model StudentParent {
+  id           String   @id @default(uuid())
+  studentId    String
+  parentId     String
+  relationship String   // "Father", "Mother", "Guardian"
+  isPrimary    Boolean  @default(false)
+  student      Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  parent       Parent   @relation(fields: [parentId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, parentId])
+  @@map("student_parents")
+}
+
+// 6. Classes & Timetables
+model Class {
+  id           String                    @id @default(uuid())
+  campusId     String
+  campus       Campus                    @relation(fields: [campusId], references: [id])
+  name         String                    // "Hifz Section A", "Noorani Qaida Group 1"
+  section      String?
+  academicYear String                    // "2025-2026"
+  capacity     Int                       @default(20)
+  isActive     Boolean                   @default(true)
+
+  teachers     ClassTeacher[]
+  students     ClassStudent[]
+  attendances  StudentAttendanceRecord[]
+
+  @@map("classes")
+}
+
+model ClassTeacher {
+  id        String   @id @default(uuid())
+  classId   String
+  teacherId String
+  isLead    Boolean  @default(false)
+  class     Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  teacher   Teacher  @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@unique([classId, teacherId])
+  @@map("class_teachers")
+}
+
+model ClassStudent {
+  id         String   @id @default(uuid())
+  classId    String
+  studentId  String
+  enrolledAt DateTime @default(now())
+  class      Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([classId, studentId])
+  @@map("class_students")
+}
+
+// 7. Dual Attendance Workflows
+
+// A. Teacher Attendance (Self Check-in & Admin with Strict Time Window Rules)
+model TeacherAttendanceRecord {
+  id                String                  @id @default(uuid())
+  campusId          String
+  teacherId         String
+  date              DateTime                @db.Date
+  status            TeacherAttendanceStatus
+  checkInTime       DateTime?
+  checkOutTime      DateTime?
+  ruleApplied       String?                 // e.g. "UP_TO_5PM", "LATE_WINDOW_5_01_TO_5_30", "AFTER_5_30PM_AUTO_ABSENT"
+  isSystemGenerated Boolean                 @default(false)
+  remarks           String?
+  recordedBy        String                  // Teacher or Admin User ID
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+
+  campus            Campus                  @relation(fields: [campusId], references: [id])
+  teacher           Teacher                 @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+
+  @@unique([teacherId, date])
+  @@map("teacher_attendances")
+}
+
+// B. Student Attendance (Recorded by Teacher / Admin)
+model StudentAttendanceRecord {
+  id          String           @id @default(uuid())
+  campusId    String
+  classId     String
+  studentId   String
+  date        DateTime         @db.Date
+  status      AttendanceStatus
+  arrivalTime String?          // HH:mm check-in timestamp
+  ruleApplied String?
+  remarks     String?
+  recordedBy  String           // Teacher or Admin User ID
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  campus      Campus           @relation(fields: [campusId], references: [id])
+  class       Class            @relation(fields: [classId], references: [id])
+  student     Student          @relation(fields: [studentId], references: [id])
+
+  @@unique([classId, studentId, date])
+  @@map("student_attendances")
+}
+
+// 8. Academic Progress & Quranic Memorization Tracking
+model AcademicProgress {
+  id           String   @id @default(uuid())
+  studentId    String
+  teacherId    String
+  date         DateTime @db.Date
+
+  // Islamic / Quranic Specific Progress
+  sabaqSurah   String?  // Current Surah lesson (e.g. "Al-Baqarah")
+  sabaqAyah    String?  // Lesson Ayah range (e.g. "Ayah 142-152")
+  sabqiJuz     String?  // Recent revision Juz
+  manzilJuz    String?  // Distant revision Juz
+  tajweedScore Int?     // 1 to 5 scale
+
+  // Standard Subject Grade (Optional)
+  subject      String?  // "Quranic Arabic", "Fiqh", "Hadith"
+  score        Float?
+  maxScore     Float?
+  feedback     String?  @db.Text
+  createdAt    DateTime @default(now())
+
+  student      Student  @relation(fields: [studentId], references: [id])
+  teacher      Teacher  @relation(fields: [teacherId], references: [id])
+
+  @@map("academic_progress")
+}
+
+// 9. Fee Structures & Payments (Multi-Currency GBP & PKR)
+model FeeStructure {
+  id        String   @id @default(uuid())
+  campusId  String
+  campus    Campus   @relation(fields: [campusId], references: [id])
+  name      String   // "Monthly Hifz Tuition", "Admission Fee"
+  amount    Decimal  @db.Decimal(10, 2)
+  currency  String   // "GBP", "PKR"
+  frequency String   // "MONTHLY", "TERMLY", "ONE_TIME"
+  isActive  Boolean  @default(true)
+
+  @@map("fee_structures")
+}
+
+model Payment {
+  id            String        @id @default(uuid())
+  campusId      String
+  campus        Campus        @relation(fields: [campusId], references: [id])
+  studentId     String
+  student       Student       @relation(fields: [studentId], references: [id])
+  invoiceNumber String        @unique
+  title         String
+  amountDue     Decimal       @db.Decimal(10, 2)
+  amountPaid    Decimal       @db.Decimal(10, 2) @default(0)
+  currency      String        // "GBP", "PKR"
+  status        PaymentStatus
+  dueDate       DateTime
+  paidDate      DateTime?
+  paymentMethod String?       // "Bank Transfer", "Card", "Cash"
+  receiptUrl    String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@map("payments")
+}
+
+// 10. Incidents & Medical Reports
+model IncidentReport {
+  id          String       @id @default(uuid())
+  campusId    String
+  campus      Campus       @relation(fields: [campusId], references: [id])
+  studentId   String
+  student     Student      @relation(fields: [studentId], references: [id])
+  reporterId  String
+  reporter    Teacher      @relation(fields: [reporterId], references: [id])
+  type        String       // "BEHAVIORAL", "ACADEMIC", "MEDICAL", "INJURY"
+  severity    String       // "LOW", "MEDIUM", "HIGH"
+  description String       @db.Text
+  actionTaken String?      @db.Text
+  status      ReportStatus @default(SUBMITTED)
+  reviewedBy  String?      // Admin User ID
+  reviewNotes String?
+  createdAt   DateTime     @default(now())
+
+  @@map("incident_reports")
+}
+
+// 11. Announcements & Campus Notices
+model Announcement {
+  id          String    @id @default(uuid())
+  campusId    String?   // NULL = Global (All Campuses)
+  campus      Campus?   @relation(fields: [campusId], references: [id])
+  title       String
+  content     String    @db.Text
+  priority    String    // "NORMAL", "URGENT"
+  targetRole  String    // "ALL", "TEACHERS", "PARENTS", "ADMINS"
+  publishedAt DateTime  @default(now())
+  expiresAt   DateTime?
+
+  @@map("announcements")
+}
+
+// 12. Security Audit Log
+model AuditLog {
+  id         String   @id @default(uuid())
+  campusId   String?
+  campus     Campus?  @relation(fields: [campusId], references: [id])
+  userId     String
+  user       User     @relation("UserAudits", fields: [userId], references: [id])
+  action     String   // "TEACHER_ATTENDANCE_MARKED", "PAYMENT_CONFIRMED"
+  entityType String
+  entityId   String
+  metadata   Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@map("audit_logs")
+}
