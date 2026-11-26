@@ -72,7 +72,7 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
     setShowNewPassword(true);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccessMsg('');
@@ -95,8 +95,8 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
         setError('Please enter your current password to authorize changing your password.');
         return;
       }
-      if (!newPassword || newPassword.length < 6) {
-        setError('New password must be at least 6 characters long.');
+      if (!newPassword || newPassword.length < 8) {
+        setError('New password must be at least 8 characters long.');
         return;
       }
       if (newPassword !== confirmPassword) {
@@ -106,8 +106,8 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
     }
 
     setIsLoading(true);
-    setTimeout(() => {
-      const res = IMSStateService.updateCurrentProfile({
+    {
+      const res = await IMSStateService.updateCurrentProfile({
         fullName: fullName.trim(),
         email: email.trim(),
         username: username.trim(),
@@ -126,7 +126,7 @@ export const EditProfileModal: React.FC<EditProfileModalProps> = ({
       } else {
         setError(res.message);
       }
-    }, 300);
+    }
   };
 
   return (

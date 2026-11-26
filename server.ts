@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import * as authSvc from './server/authService.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -85,7 +86,8 @@ function getValidSupabaseServiceKey(...candidates: (string | undefined)[]): stri
   for (const c of candidates) {
     if (!c) continue;
     const trimmed = c.trim();
-    if (isValidJwtToken(trimmed)) {
+    // Legacy JWT service_role key (eyJ...) or new-format Supabase secret key (sb_secret_...).
+    if (isValidJwtToken(trimmed) || /^sb_secret_[A-Za-z0-9_-]{20,}$/.test(trimmed)) {
       return trimmed;
     }
   }
@@ -182,6 +184,8 @@ interface RequestUser {
   role: 'SUPER_ADMIN' | 'CAMPUS_ADMIN' | 'TEACHER' | 'PARENT';
   activeCampusId: string;
   allowedCampusIds: string[];
+  authUserId?: string;
+  teacherProfileId?: string;
 }
 
 declare global {
@@ -214,6 +218,38 @@ const authenticateUser = async (req: Request, res: Response, next: NextFunction)
   }
 
   try {
+    // Supabase mode: the token must be a valid Supabase Auth access token (signature verified by Supabase).
+    if (serverSupabase) {
+      const appUser = await authSvc.verifyAccessToken(serverSupabase, token);
+      if (!appUser) {
+        res.status(401).json({
+          error: 'Unauthorized: Invalid or expired session. Please sign in again.',
+          code: 'INVALID_CREDENTIALS',
+        });
+        return;
+      }
+      if (!appUser.isActive) {
+        res.status(403).json({
+          error: 'Forbidden: Account has been deactivated or suspended by administration.',
+          code: 'ACCOUNT_SUSPENDED',
+        });
+        return;
+      }
+      req.user = {
+        id: appUser.id,
+        email: appUser.email,
+        fullName: appUser.fullName,
+        role: appUser.role as RequestUser['role'],
+        activeCampusId: appUser.campusId,
+        allowedCampusIds: appUser.allowedCampusIds,
+        authUserId: appUser.authUserId,
+        teacherProfileId: appUser.teacherProfileId,
+      };
+      next();
+      return;
+    }
+
+    // Local ledger mode (Supabase NOT configured) — development only.
     const db = getDatabaseState();
     const localUsers: any[] = db?.users || [];
 
@@ -231,66 +267,6 @@ const authenticateUser = async (req: Request, res: Response, next: NextFunction)
         u.email?.toLowerCase() === extractedId.toLowerCase() ||
         u.username?.toLowerCase() === extractedId.toLowerCase()
     );
-
-    // 2. If not found and Supabase is configured, look up in Supabase users table
-    if (!matchedUser && serverSupabase) {
-      const { data: sbUsers } = await serverSupabase
-        .from('users')
-        .select('*')
-        .or(`id.eq.${extractedId},email.eq.${extractedId},username.eq.${extractedId}`)
-        .limit(1);
-
-      if (sbUsers && sbUsers.length > 0) {
-        const u = sbUsers[0];
-        matchedUser = {
-          id: u.id,
-          email: u.email,
-          fullName: `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email,
-          role: u.role,
-          campusId: u.active_campus_id || 'all',
-          allowedCampusIds: Array.isArray(u.allowed_campus_ids) ? u.allowed_campus_ids : [u.active_campus_id || 'all'],
-          isActive: u.status === 1 || u.status === true,
-        };
-      }
-    }
-
-    // 3. Fallback for administrative role tokens & demo / master credentials
-    if (!matchedUser) {
-      if (token === 'jwt-superadmin-master' || token === 'adm-token' || token.includes('superadmin')) {
-        const primarySuper = localUsers.find((u) => u.role === 'SUPER_ADMIN' && u.isActive !== false);
-        matchedUser = primarySuper || {
-          id: 'usr-super-01',
-          email: 'admin@misbah.org',
-          fullName: 'Executive Super Administrator',
-          role: 'SUPER_ADMIN',
-          campusId: 'all',
-          allowedCampusIds: ['all', 'uk', 'kts'],
-          isActive: true,
-        };
-      } else if (token.includes('admin-uk') || token.includes('adm-uk') || token.includes('admin.uk') || extractedId === 'usr-admin-uk-01') {
-        const ukAdmin = localUsers.find((u) => u.id === 'usr-admin-uk-01' || u.username === 'admin.uk');
-        matchedUser = ukAdmin || {
-          id: 'usr-admin-uk-01',
-          email: 'admin.uk@misbah.org',
-          fullName: 'Ustadh Tariq Mahmood',
-          role: 'CAMPUS_ADMIN',
-          campusId: 'uk',
-          allowedCampusIds: ['uk'],
-          isActive: true,
-        };
-      } else if (token.includes('admin-kts') || token.includes('adm-kts') || token.includes('admin.kts') || extractedId === 'usr-admin-kts-01') {
-        const ktsAdmin = localUsers.find((u) => u.id === 'usr-admin-kts-01' || u.username === 'admin.kts');
-        matchedUser = ktsAdmin || {
-          id: 'usr-admin-kts-01',
-          email: 'admin.kts@misbah.org',
-          fullName: 'Abdul Rehman Khan',
-          role: 'CAMPUS_ADMIN',
-          campusId: 'kts',
-          allowedCampusIds: ['kts'],
-          isActive: true,
-        };
-      }
-    }
 
     if (!matchedUser) {
       res.status(401).json({
@@ -383,7 +359,18 @@ function getDatabaseState() {
   return null;
 }
 
+// Collections whose source of truth is Supabase. When Supabase is configured they are
+// never written to the local JSON file (it only keeps features that have no table yet).
+const SUPABASE_BACKED_KEYS = [
+  'campuses', 'users', 'teachers', 'classes', 'students', 'payments',
+  'teacherAttendance', 'studentAttendance', 'incidents', 'medicalRecords', 'auditLogs',
+];
+
 function saveDatabaseState(state: any): boolean {
+  if (serverSupabase && state && typeof state === 'object') {
+    state = { ...state };
+    for (const key of SUPABASE_BACKED_KEYS) delete state[key];
+  }
   try {
     const dir = path.dirname(DB_FILE);
     if (!fs.existsSync(dir)) {
@@ -419,6 +406,35 @@ const enforceCampusAccess = (req: Request, res: Response, targetCampusId: string
   return true;
 };
 
+/** Only Super Admin and Campus Admin may perform this action. */
+const requireAdmin = (req: Request, res: Response): boolean => {
+  if (req.user?.role === 'SUPER_ADMIN' || req.user?.role === 'CAMPUS_ADMIN') return true;
+  res.status(403).json({ error: 'Forbidden: only administrators can perform this action.' });
+  return false;
+};
+
+/**
+ * Enforces campus isolation for an existing record. With Supabase the record's campus is
+ * read from the database (never from the local cache); a missing record is a 404.
+ */
+async function enforceRecordCampus(
+  req: Request, res: Response, table: string, id: string, cachedCampusId?: string
+): Promise<boolean> {
+  if (serverSupabase) {
+    const { data, error } = await serverSupabase.from(table).select('campus_id').eq('id', id).maybeSingle();
+    if (error) {
+      res.status(500).json({ error: `Could not verify record: ${error.message}` });
+      return false;
+    }
+    if (!data) {
+      res.status(404).json({ error: 'Record not found.' });
+      return false;
+    }
+    return enforceCampusAccess(req, res, data.campus_id);
+  }
+  return cachedCampusId ? enforceCampusAccess(req, res, cachedCampusId) : true;
+}
+
 // Full Database State Retrieval with Role-Based Campus Scoping & Authoritative Supabase Integration
 app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async (req: Request, res: Response) => {
   let db = getDatabaseState() || {};
@@ -446,15 +462,27 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
         serverSupabase.from('payment_invoices').select('*').order('created_at', { ascending: false }),
         serverSupabase.from('teacher_attendances').select('*').limit(300),
         serverSupabase.from('student_attendances').select('*').limit(500),
-        serverSupabase.from('audit_logs').select('*').order('timestamp', { ascending: false }).limit(200),
+        serverSupabase.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(200),
         serverSupabase.from('incident_logs').select('*').order('created_at', { ascending: false }).limit(200),
       ]);
+
+      const failed = [campusesRes, usersRes, teachersRes, classesRes, studentsRes, paymentsRes, teacherAttRes, studentAttRes, auditLogsRes, incidentLogsRes]
+        .filter((r: any) => r.error);
+      if (failed.length > 0) {
+        console.error('[Server Supabase] State load failed:', failed.map((r: any) => r.error.message).join('; '));
+        res.status(502).json({ error: 'Could not load data from the database. Please try again.' });
+        return;
+      }
+      // Start Supabase-backed collections empty so stale local copies can never leak through.
+      for (const key of SUPABASE_BACKED_KEYS) db[key] = [];
+      db.incidents = [];
+      db.medicalRecords = [];
 
       const liveUsers = usersRes.data || [];
       const userMap = new Map<string, any>(liveUsers.map((u: any) => [u.id, u]));
 
       // 1. Live Campuses from Supabase
-      if (campusesRes.data && campusesRes.data.length > 0) {
+      if (campusesRes.data) {
         db.campuses = campusesRes.data.map((c: any) => ({
           id: c.id,
           code: c.code,
@@ -482,14 +510,13 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
           campusId: u.active_campus_id,
           allowedCampusIds: Array.isArray(u.allowed_campus_ids) ? u.allowed_campus_ids : ['all', 'uk', 'kts'],
           isActive: u.status === 1 || u.status === true,
-          password: u.password || 'admin123',
           contactNumber: u.contact_number,
           createdAt: u.created_at ? new Date(u.created_at).toISOString().split('T')[0] : '2026-01-10',
         }));
       }
 
       // 3. Live Teachers (linking teacher_profiles.teacher_id -> users.id)
-      if (teachersRes.data && teachersRes.data.length > 0) {
+      if (teachersRes.data) {
         db.teachers = teachersRes.data.map((t: any) => {
           const linkedUser = userMap.get(t.teacher_id) || {};
           const fullName = `${linkedUser.first_name || ''} ${linkedUser.last_name || ''}`.trim() || t.specialization || `Teacher ${t.employee_code || t.id}`;
@@ -517,7 +544,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
       }
 
       // 4. Live Classes from Supabase
-      if (classesRes.data && classesRes.data.length > 0) {
+      if (classesRes.data) {
         db.classes = classesRes.data.map((c: any) => {
           const teacherUser = c.teacher_id ? userMap.get(c.teacher_id) : null;
           const leadTeacherName = teacherUser ? `${teacherUser.first_name || ''} ${teacherUser.last_name || ''}`.trim() : 'Unassigned';
@@ -526,7 +553,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
             campusId: c.campus_id || 'uk',
             name: c.title || c.name || 'General Halaqah',
             code: c.code || `${c.campus_id?.toUpperCase()}-CLS-${c.id}`,
-            gradeLevel: 'General Halaqah',
+            gradeLevel: c.grade_level || 'General Halaqah',
             academicYear: c.academic_year || '2025-2026',
             capacity: Number(c.capacity || 25),
             maxCapacity: Number(c.capacity || 25),
@@ -535,17 +562,17 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
             studentCount: 0,
             currentEnrollment: 0,
             scheduleDays: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
-            scheduleTime: '5:00 PM - 7:30 PM (Mon-Fri)',
-            room: 'Main Hall',
+            scheduleTime: c.schedule_time || '5:00 PM - 7:30 PM (Mon-Fri)',
+            room: c.room || 'Main Hall',
             isActive: c.is_active !== false,
           };
         });
       }
 
       // 5. Live Students from Supabase
-      if (studentsRes.data && studentsRes.data.length > 0) {
+      if (studentsRes.data) {
         const classMap = new Map((db.classes || []).map((cl: any) => [cl.id, cl]));
-        db.students = studentsRes.data.map((s: any) => {
+        db.students = studentsRes.data.filter((s: any) => s.status !== 'archived').map((s: any) => {
           const matchedClass: any = s.class_id ? classMap.get(s.class_id) : undefined;
           let parsedParentContact: { name?: string; phone?: string } | null = null;
           try {
@@ -588,7 +615,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
       }
 
       // 6. Live Payments from Supabase
-      if (paymentsRes.data && paymentsRes.data.length > 0) {
+      if (paymentsRes.data) {
         db.payments = paymentsRes.data.map((p: any) => ({
           id: String(p.id),
           studentId: p.reference_id,
@@ -608,11 +635,15 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
       }
 
       // 7. Live Attendance from Supabase
-      if (teacherAttRes.data && teacherAttRes.data.length > 0) {
+      if (teacherAttRes.data) {
+        // Supabase stores the user id; the portal keys attendance by teacher_profiles id.
+        const profileIdByUserId = new Map<string, string>(
+          (teachersRes.data || []).map((p: any) => [p.teacher_id, p.id])
+        );
         db.teacherAttendance = teacherAttRes.data.map((a: any) => ({
           id: a.id || `att-tch-${a.teacher_id}-${a.date}`,
           campusId: a.campus_id,
-          teacherId: a.teacher_id,
+          teacherId: profileIdByUserId.get(a.teacher_id) || a.teacher_id,
           date: a.date,
           status: a.status,
           checkInTime: a.check_in_time,
@@ -623,7 +654,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
         }));
       }
 
-      if (studentAttRes.data && studentAttRes.data.length > 0) {
+      if (studentAttRes.data) {
         db.studentAttendance = studentAttRes.data.map((a: any) => ({
           id: a.id || `att-std-${a.student_id}-${a.date}`,
           campusId: a.campus_id,
@@ -638,7 +669,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
       }
 
       // 8. Live Incidents & Medical Records from Supabase incident_logs
-      if (incidentLogsRes.data && incidentLogsRes.data.length > 0) {
+      if (incidentLogsRes.data) {
         const studentMap = new Map((db.students || []).map((s: any) => [s.id, `${s.firstName} ${s.lastName}`.trim()]));
         const incidents: any[] = [];
         const medicals: any[] = [];
@@ -714,10 +745,27 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
         }
       }
 
-      // Save live authoritative snapshot to disk cache
-      saveDatabaseState({ ...db, updatedAt: new Date().toISOString() });
+      db.auditLogs = (auditLogsRes.data || []).map((log: any) => {
+        const actor = log.user_id ? userMap.get(log.user_id) : null;
+        const d = log.details && typeof log.details === 'object' ? log.details : {};
+        return {
+          id: log.id,
+          campusId: log.campus_id || undefined,
+          userId: log.user_id || 'system',
+          userName: actor ? `${actor.first_name || ''} ${actor.last_name || ''}`.trim() || actor.email : (d.deleted_by || d.archived_by || 'System'),
+          userRole: actor?.role || 'SUPER_ADMIN',
+          action: log.action,
+          entityType: d.entity_type || 'System',
+          entityId: String(d.entity_id || d.target_user_id || ''),
+          timestamp: (log.created_at || '').replace('T', ' ').substring(0, 19),
+          ipAddress: log.ip_address || undefined,
+          details: d.reason || d.message || JSON.stringify(d),
+        };
+      });
     } catch (err: any) {
-      console.warn('[Server Supabase] Error fetching live state from Supabase:', err?.message || err);
+      console.error('[Server Supabase] Error fetching live state from Supabase:', err?.message || err);
+      res.status(502).json({ error: 'Could not load data from the database. Please try again.' });
+      return;
     }
   }
 
@@ -733,8 +781,32 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
     return;
   }
 
+  // Parents: only their own children's records.
+  if (user.role === 'PARENT') {
+    const children = (db.students || []).filter((s: any) => Array.isArray(s.parentIds) && s.parentIds.includes(user.id));
+    const childIds = new Set(children.map((s: any) => s.id));
+    const childClassIds = new Set(children.map((s: any) => s.classId));
+    res.json({
+      success: true,
+      data: {
+        campuses: db.campuses || [],
+        students: children,
+        classes: (db.classes || []).filter((c: any) => childClassIds.has(c.id)),
+        payments: (db.payments || []).filter((p: any) => childIds.has(p.studentId)),
+        studentAttendance: (db.studentAttendance || []).filter((a: any) => childIds.has(a.studentId)),
+        examResults: (db.examResults || []).filter((e: any) => childIds.has(e.studentId)),
+        teachers: [], parents: [], users: [], auditLogs: [], incidents: [], teacherAttendance: [],
+      },
+      scopedCampus: user.allowedCampusIds,
+      authoritativeSource: serverSupabase ? 'supabase' : 'local_cache',
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
   // If Campus Admin or Teacher, filter strictly to allowed campus(es)
   const allowed = user.allowedCampusIds || [user.activeCampusId];
+  const isCampusAdmin = user.role === 'CAMPUS_ADMIN';
   const filterByCampus = (items?: any[]) => {
     if (!Array.isArray(items)) return [];
     return items.filter((item) => !item.campusId || item.campusId === 'all' || allowed.includes(item.campusId));
@@ -744,18 +816,20 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
     campuses: db.campuses ? db.campuses.filter((c: any) => allowed.includes(c.id)) : [],
     students: filterByCampus(db.students),
     teachers: filterByCampus(db.teachers),
-    parents: db.parents || [],
+    parents: filterByCampus(db.parents),
     classes: filterByCampus(db.classes),
-    payments: filterByCampus(db.payments),
+    payments: isCampusAdmin ? filterByCampus(db.payments) : [],
     expenses: filterByCampus(db.expenses),
-    teacherAttendance: filterByCampus(db.teacherAttendance),
+    teacherAttendance: isCampusAdmin
+      ? filterByCampus(db.teacherAttendance)
+      : (db.teacherAttendance || []).filter((a: any) => a.teacherId === (user as any).teacherProfileId || a.teacherId === user.id),
     studentAttendance: filterByCampus(db.studentAttendance),
     academicProgress: filterByCampus(db.academicProgress),
     incidents: filterByCampus(db.incidents),
     announcements: filterByCampus(db.announcements),
-    auditLogs: filterByCampus(db.auditLogs),
+    auditLogs: isCampusAdmin ? filterByCampus(db.auditLogs).filter((l: any) => l.campusId) : [],
     salaryRecords: filterByCampus(db.salaryRecords),
-    examResults: db.examResults || [],
+    examResults: filterByCampus(db.examResults),
     pendingAdmissions: filterByCampus(db.pendingAdmissions),
     pendingTeachers: filterByCampus(db.pendingTeachers),
     users: db.users ? db.users.filter((u: any) => u.campusId === 'all' || allowed.includes(u.campusId)) : [],
@@ -871,19 +945,145 @@ app.get('/api/auth/setup-status', (req: Request, res: Response) => {
   });
 });
 
-// Auth Login Route
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { identifier, password } = req.body;
-  if (!identifier || !password) {
+/** Finds a teacher profile by its id, linked user id, or employee code (literal matches only). */
+async function findTeacherProfile(identifier: string, columns: string): Promise<any | null> {
+  if (!serverSupabase || !identifier) return null;
+  for (const column of ['id', 'teacher_id', 'employee_code']) {
+    const { data } = await serverSupabase.from('teacher_profiles').select(columns).eq(column, identifier).limit(1).maybeSingle();
+    if (data) return data;
+  }
+  return null;
+}
+
+// Auth Login Route — verifies credentials with Supabase Auth and returns a Supabase session.
+const serverAnonKey = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+
+async function writeAuthAudit(action: string, campusId: string | null, userId: string | null, details: Record<string, any>) {
+  if (!serverSupabase) return;
+  try {
+    await serverSupabase.from('audit_logs').insert([{
+      campus_id: campusId && campusId !== 'all' ? campusId : null,
+      user_id: userId,
+      action,
+      details,
+    }]);
+  } catch {
+    // audit logging must never block authentication
+  }
+}
+
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  const { identifier, password } = req.body || {};
+  if (typeof identifier !== 'string' || typeof password !== 'string' || !identifier.trim() || !password) {
     res.status(400).json({ error: 'Username/Email and password are required.' });
     return;
   }
+  if (!serverSupabase) {
+    res.status(501).json({ error: 'Server authentication requires Supabase.', code: 'LOCAL_MODE' });
+    return;
+  }
+  if (!serverAnonKey) {
+    res.status(500).json({ error: 'Server is missing the Supabase anon key needed to verify passwords.' });
+    return;
+  }
 
-  // Client-side authentication verifies against stored authenticated profiles in IMSStateService
-  res.json({
-    success: true,
-    message: 'Authentication processed by verified credential store.',
-  });
+  const cleanId = identifier.trim().toLowerCase();
+  const limiterKeys = [`id:${cleanId}`, `ip:${req.ip || 'unknown'}`];
+  if (authSvc.isRateLimited(limiterKeys)) {
+    res.status(429).json({ error: 'Too many failed sign-in attempts. Please wait 15 minutes and try again.' });
+    return;
+  }
+
+  const genericError = 'Invalid credentials. Please verify your email or username and password.';
+  try {
+    const row = await authSvc.findUserRowByIdentifier(serverSupabase, cleanId);
+    if (!row || !row.auth_user_id || !row.email) {
+      authSvc.recordFailedAttempt(limiterKeys);
+      await writeAuthAudit('FAILED_LOGIN_ATTEMPT', null, null, { identifier: cleanId, reason: 'unknown account' });
+      res.status(401).json({ error: genericError });
+      return;
+    }
+    if (String(row.role).toUpperCase() === 'STUDENT') {
+      res.status(403).json({
+        error: 'Direct student login is disabled. Parents access student records through the Parent Portal. Please sign in using guardian credentials.',
+      });
+      return;
+    }
+
+    const verifier = authSvc.createPasswordVerifier(serverSupabaseUrl, serverAnonKey);
+    const { data, error } = await verifier.auth.signInWithPassword({ email: row.email, password });
+    if (error || !data?.session || !data.user) {
+      authSvc.recordFailedAttempt(limiterKeys);
+      await writeAuthAudit('FAILED_LOGIN_ATTEMPT', row.active_campus_id, row.id, { identifier: cleanId, reason: 'bad password' });
+      const banned = /banned/i.test(error?.message || '');
+      res.status(banned ? 403 : 401).json({
+        error: banned
+          ? 'This account has been deactivated or suspended by the Super Administrator. Please contact central administration.'
+          : genericError,
+      });
+      return;
+    }
+
+    const appUser = await authSvc.loadAppUserByAuthId(serverSupabase, data.user.id);
+    if (!appUser || !appUser.isActive) {
+      res.status(403).json({
+        error: 'This account has been deactivated or suspended by the Super Administrator. Please contact central administration.',
+      });
+      return;
+    }
+
+    authSvc.clearAttempts(limiterKeys);
+    await serverSupabase.from('users').update({ updated_at: new Date().toISOString() }).eq('id', appUser.id);
+    await writeAuthAudit('USER_LOGIN', appUser.campusId, appUser.id, { role: appUser.role });
+
+    res.json({
+      success: true,
+      session: {
+        access_token: data.session.access_token,
+        refresh_token: data.session.refresh_token,
+        expires_at: data.session.expires_at,
+      },
+      user: {
+        id: appUser.id,
+        email: appUser.email,
+        username: appUser.username,
+        fullName: appUser.fullName,
+        role: appUser.role,
+        activeCampusId: appUser.campusId,
+        allowedCampusIds: appUser.allowedCampusIds,
+        teacherProfileId: appUser.teacherProfileId,
+      },
+    });
+  } catch (err: any) {
+    console.error('[Auth] Login error:', err?.message || err);
+    res.status(500).json({ error: 'Authentication service error. Please try again.' });
+  }
+});
+
+// Change own password (requires the current password).
+app.post('/api/auth/change-password', authenticateUser, async (req: Request, res: Response) => {
+  const { currentPassword, newPassword } = req.body || {};
+  if (!serverSupabase || !req.user?.authUserId) {
+    res.status(501).json({ error: 'Password changes require Supabase authentication.' });
+    return;
+  }
+  if (typeof currentPassword !== 'string' || typeof newPassword !== 'string' || newPassword.length < 8) {
+    res.status(400).json({ error: 'Current password and a new password of at least 8 characters are required.' });
+    return;
+  }
+  const verifier = authSvc.createPasswordVerifier(serverSupabaseUrl, serverAnonKey);
+  const { error: verifyErr } = await verifier.auth.signInWithPassword({ email: req.user.email, password: currentPassword });
+  if (verifyErr) {
+    res.status(400).json({ error: 'Current password entered is incorrect.' });
+    return;
+  }
+  try {
+    await authSvc.updateAuthAccount(serverSupabase, req.user.authUserId, { password: newPassword });
+    await writeAuthAudit('USER_PASSWORD_CHANGED', req.user.activeCampusId, req.user.id, {});
+    res.json({ success: true, message: 'Password updated successfully.' });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to update password.' });
+  }
 });
 
 // Campuses Endpoint
@@ -998,25 +1198,22 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
 
     // If Supabase is configured on server, perform authoritative database operations
     if (serverSupabase) {
-      // 1. Check if user already exists
-      const { data: existingUser, error: checkError } = await serverSupabase
-        .from('users')
-        .select('id, email, username')
-        .or(`email.eq.${cleanEmail},username.eq.${employeeCode.toLowerCase()}`)
-        .limit(1);
-
-      if (checkError) {
-        console.error('[Server Supabase] Failed to check existing user:', checkError);
-        res.status(500).json({
-          error: `Database query failed: ${checkError.message}. Please verify SUPABASE_SERVICE_ROLE_KEY in your server configuration.`,
+      // 1. Check if user already exists (literal, case-insensitive match; no filter interpolation)
+      if (await authSvc.identifierTaken(serverSupabase, cleanEmail, employeeCode.toLowerCase())) {
+        res.status(400).json({
+          error: `A user account with email "${cleanEmail}" or employee code "${employeeCode}" already exists.`,
         });
         return;
       }
 
-      if (existingUser && existingUser.length > 0) {
-        res.status(400).json({
-          error: `A user account with email "${cleanEmail}" or employee code "${employeeCode}" already exists in Supabase.`,
+      // 1b. Create the Supabase Auth account that holds the teacher's credentials.
+      let teacherAuthUserId: string;
+      try {
+        teacherAuthUserId = await authSvc.createAuthAccount(serverSupabase, {
+          email: cleanEmail, password, appUserId: userId, role: 'TEACHER',
         });
+      } catch (authErr: any) {
+        res.status(400).json({ error: authErr.message });
         return;
       }
 
@@ -1025,11 +1222,11 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
         .from('users')
         .insert([{
           id: userId,
+          auth_user_id: teacherAuthUserId,
           email: cleanEmail,
           username: employeeCode.toLowerCase(),
           first_name: firstName,
           last_name: lastName,
-          password: password,
           role: 'TEACHER',
           active_campus_id: targetCampus,
           allowed_campus_ids: [targetCampus], // Strict campus isolation!
@@ -1044,6 +1241,7 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
 
       if (userError || !insertedUser) {
         console.error('[Server Supabase] Failed to create user for teacher:', userError);
+        await authSvc.deleteAuthAccount(serverSupabase, teacherAuthUserId);
         res.status(500).json({ error: `Database user creation failed: ${userError?.message || 'Unknown database error'}` });
         return;
       }
@@ -1075,8 +1273,16 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
         console.error('[Server Supabase] Failed to create teacher profile:', profileError);
         // Rollback user creation to maintain database integrity
         await serverSupabase.from('users').delete().eq('id', insertedUser.id);
+        await authSvc.deleteAuthAccount(serverSupabase, teacherAuthUserId);
         res.status(500).json({ error: `Database teacher profile creation failed: ${profileError.message}` });
         return;
+      }
+
+      // 3b. Campus isolation: teacher may access only their campus.
+      try {
+        await authSvc.setCampusAccess(serverSupabase, insertedUser.id, [targetCampus]);
+      } catch (accessErr: any) {
+        console.error('[Server Supabase] Failed to set teacher campus access:', accessErr.message);
       }
 
       // 4. Update assigned classes in Supabase if specified
@@ -1177,10 +1383,10 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
       campusId: targetCampus,
       allowedCampusIds: [targetCampus],
       isActive: true,
-      password,
+      // Local ledger mode only keeps a password (development); Supabase Auth holds it otherwise.
+      ...(serverSupabase ? {} : { password, token: `jwt-${effectiveUserId}-${Date.now()}` }),
       teacherProfileId: effectiveTeacherId,
       createdAt: new Date().toISOString().substring(0, 10),
-      token: `jwt-${effectiveUserId}-${Date.now()}`,
     };
 
     const updatedTeachers = [newTeacherRecord, ...(db.teachers || []).filter((t: any) => t.id !== effectiveTeacherId)];
@@ -1248,12 +1454,11 @@ app.put('/api/teachers/:id', authenticateUser, async (req: Request, res: Respons
       let currentProfile: any = null;
 
       // 1a. Search by URL parameter id
-      const { data: profileById, error: findErr1 } = await serverSupabase
-        .from('teacher_profiles')
-        .select('id, teacher_id, campus_id, employee_code, specialization, qualification, salary, salary_currency, status, assigned_class_ids')
-        .or(`id.eq.${id},teacher_id.eq.${id},employee_code.eq.${id}`)
-        .limit(1)
-        .maybeSingle();
+      const profileById = await findTeacherProfile(
+        id,
+        'id, teacher_id, campus_id, employee_code, specialization, qualification, salary, salary_currency, status, assigned_class_ids'
+      );
+      const findErr1 = null;
 
       if (profileById) {
         currentProfile = profileById;
@@ -1716,12 +1921,7 @@ app.delete('/api/teachers/:id', authenticateUser, async (req: Request, res: Resp
 
     if (serverSupabase) {
       // Find profile by id, teacher_id, or employee_code
-      const { data: foundProfile } = await serverSupabase
-        .from('teacher_profiles')
-        .select('id, teacher_id, campus_id, employee_code')
-        .or(`id.eq.${id},teacher_id.eq.${id},employee_code.eq.${id}`)
-        .limit(1)
-        .maybeSingle();
+      const foundProfile = await findTeacherProfile(id, 'id, teacher_id, campus_id, employee_code');
 
       profile = foundProfile;
 
@@ -1752,7 +1952,7 @@ app.delete('/api/teachers/:id', authenticateUser, async (req: Request, res: Resp
           await serverSupabase
             .from('classes')
             .update({ teacher_id: null })
-            .or(`teacher_id.eq.${profile.teacher_id},teacher_id.eq.${profile.id}`);
+            .in('teacher_id', [profile.teacher_id, profile.id]);
         } catch (clsErr) {
           console.warn('[Server Supabase] Error unlinking classes for teacher:', clsErr);
         }
@@ -1779,16 +1979,28 @@ app.delete('/api/teachers/:id', authenticateUser, async (req: Request, res: Resp
 
       // 3. Delete linked user account from users table
       if (profile.teacher_id) {
+        const { data: linkedUser } = await serverSupabase
+          .from('users').select('auth_user_id').eq('id', profile.teacher_id).maybeSingle();
         const { data: delUserData, error: delUserErr, count: delUserCount } = await serverSupabase
           .from('users')
           .delete({ count: 'exact' })
           .eq('id', profile.teacher_id)
           .select();
 
-        if (delUserErr) {
+        if (delUserErr && delUserErr.code === '23503') {
+          // Attendance history references this teacher: keep it, but disable the account.
+          await serverSupabase.from('users').update({ status: 0 }).eq('id', profile.teacher_id);
+          if (linkedUser?.auth_user_id) {
+            await authSvc.updateAuthAccount(serverSupabase, linkedUser.auth_user_id, { isActive: false });
+          }
+          console.info(`[Server Supabase] Teacher user ${profile.teacher_id} has history; account deactivated instead of deleted.`);
+        } else if (delUserErr) {
           console.error('[Server Supabase] Error deleting user account for teacher:', delUserErr);
+          res.status(500).json({ success: false, error: `Teacher profile removed, but the login account could not be removed: ${delUserErr.message}` });
+          return;
         } else {
           deletedUserCount = delUserData ? delUserData.length : (delUserCount ?? 1);
+          await authSvc.deleteAuthAccount(serverSupabase, linkedUser?.auth_user_id);
         }
       }
 
@@ -1984,6 +2196,9 @@ app.post('/api/students/provision', authenticateUser, async (req: Request, res: 
       admission_fee_amount: Number(admissionFee || 0),
       admission_date: enrollmentDate || new Date().toISOString().substring(0, 10),
       primary_contact_details: primaryParentPhone ? { name: primaryParentName, phone: primaryParentPhone } : null,
+      blood_group: bloodGroup || null,
+      medical_notes: medicalNotes?.trim() || null,
+      quran_milestone: quranMilestone || null,
     };
 
     if (serverSupabase) {
@@ -2066,7 +2281,10 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
     const db = getDatabaseState() || {};
     const existing = (db.students || []).find((s: any) => s.id === id);
 
-    if (existing && !enforceCampusAccess(req, res, existing.campusId)) {
+    if (!requireAdmin(req, res)) {
+      return;
+    }
+    if (!(await enforceRecordCampus(req, res, 'students', id, existing?.campusId))) {
       return;
     }
 
@@ -2098,6 +2316,30 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
       if (updates.monthlyFee !== undefined) sbUpdates.monthly_fee_amount = Number(updates.monthlyFee);
       if (updates.admissionFee !== undefined) sbUpdates.admission_fee_amount = Number(updates.admissionFee);
       if (updates.isActive !== undefined) sbUpdates.status = updates.isActive ? 'active' : 'inactive';
+      if (updates.enrollmentDate !== undefined) sbUpdates.admission_date = updates.enrollmentDate || null;
+      if (updates.approvalStatus !== undefined) sbUpdates.approval_status = updates.approvalStatus;
+      if (updates.bloodGroup !== undefined) sbUpdates.blood_group = updates.bloodGroup || null;
+      if (updates.medicalNotes !== undefined) sbUpdates.medical_notes = updates.medicalNotes || null;
+      if (updates.quranMilestone !== undefined) sbUpdates.quran_milestone = updates.quranMilestone || null;
+      if (updates.primaryParentName !== undefined || updates.primaryParentPhone !== undefined) {
+        // Merge with the stored contact so a partial edit (only name or only phone) keeps the other value.
+        let currentContact: { name?: string; phone?: string } = {};
+        const { data: contactRow } = await serverSupabase
+          .from('students')
+          .select('primary_contact_details')
+          .eq('id', id)
+          .maybeSingle();
+        const raw = contactRow?.primary_contact_details;
+        try {
+          currentContact = (typeof raw === 'string' ? JSON.parse(raw) : raw) || {};
+        } catch {
+          currentContact = {};
+        }
+        sbUpdates.primary_contact_details = {
+          name: updates.primaryParentName !== undefined ? updates.primaryParentName : currentContact.name,
+          phone: updates.primaryParentPhone !== undefined ? updates.primaryParentPhone : currentContact.phone,
+        };
+      }
 
       const { error: updateError } = await serverSupabase
         .from('students')
@@ -2128,17 +2370,47 @@ app.delete('/api/students/:id', authenticateUser, async (req: Request, res: Resp
     const db = getDatabaseState() || {};
     const existing = (db.students || []).find((s: any) => s.id === id);
 
-    if (existing && !enforceCampusAccess(req, res, existing.campusId)) {
+    if (!requireAdmin(req, res)) {
+      return;
+    }
+    if (!(await enforceRecordCampus(req, res, 'students', id, existing?.campusId))) {
       return;
     }
 
     if (serverSupabase) {
-      const { error: delError } = await serverSupabase.from('students').delete().eq('id', id);
-      if (delError) {
-        console.error('[Server Supabase] Student delete error:', delError);
-        res.status(500).json({ error: `Supabase student delete failed: ${delError.message}` });
+      const { data: row } = await serverSupabase
+        .from('students').select('id, campus_id, first_name, last_name, roll_number').eq('id', id).maybeSingle();
+      if (!row) {
+        res.status(404).json({ error: 'Student not found.' });
         return;
       }
+      if (!enforceCampusAccess(req, res, row.campus_id)) {
+        return;
+      }
+      // Soft delete: the student disappears from the app but attendance, invoices
+      // and medical history stay intact.
+      const nowIso = new Date().toISOString();
+      const { error: archiveError } = await serverSupabase
+        .from('students')
+        .update({ status: 'archived', archived_at: nowIso })
+        .eq('id', id);
+      if (archiveError) {
+        console.error('[Server Supabase] Student archive error:', archiveError);
+        res.status(500).json({ error: `Supabase student archive failed: ${archiveError.message}` });
+        return;
+      }
+      await serverSupabase.from('audit_logs').insert([{
+        campus_id: row.campus_id,
+        user_id: req.user?.id || null,
+        action: 'STUDENT_ARCHIVED',
+        details: {
+          entity_type: 'Student',
+          entity_id: row.id,
+          roll_number: row.roll_number,
+          student_name: `${row.first_name || ''} ${row.last_name || ''}`.trim(),
+          archived_by: req.user?.email || 'admin',
+        },
+      }]);
     }
 
     if (db.students) {
@@ -2202,6 +2474,9 @@ app.post('/api/classes', authenticateUser, async (req: Request, res: Response) =
         capacity: Number(maxCapacity) || 25,
         academic_year: '2025-2026',
         teacher_id: validTeacherUserId,
+        grade_level: gradeLevel || null,
+        room: room || null,
+        schedule_time: scheduleTime || null,
         is_active: true,
       }]);
 
@@ -2253,7 +2528,10 @@ app.put('/api/classes/:id', authenticateUser, async (req: Request, res: Response
     const db = getDatabaseState() || {};
     const existing = (db.classes || []).find((c: any) => c.id === id);
 
-    if (existing && !enforceCampusAccess(req, res, existing.campusId)) {
+    if (!requireAdmin(req, res)) {
+      return;
+    }
+    if (!(await enforceRecordCampus(req, res, 'classes', id, existing?.campusId))) {
       return;
     }
 
@@ -2288,6 +2566,11 @@ app.put('/api/classes/:id', authenticateUser, async (req: Request, res: Response
       if (validTeacherUserId !== undefined) {
         sbUpdates.teacher_id = validTeacherUserId;
       }
+      if (updates.code !== undefined) sbUpdates.code = updates.code ? String(updates.code).trim().toUpperCase() : null;
+      if (updates.gradeLevel !== undefined) sbUpdates.grade_level = updates.gradeLevel || null;
+      if (updates.room !== undefined) sbUpdates.room = updates.room || null;
+      if (updates.scheduleTime !== undefined) sbUpdates.schedule_time = updates.scheduleTime || null;
+      if (updates.isActive !== undefined) sbUpdates.is_active = updates.isActive !== false;
 
       const { error: updErr } = await serverSupabase.from('classes').update(sbUpdates).eq('id', id);
       if (updErr) {
@@ -2314,7 +2597,10 @@ app.delete('/api/classes/:id', authenticateUser, async (req: Request, res: Respo
     const db = getDatabaseState() || {};
     const existing = (db.classes || []).find((c: any) => c.id === id);
 
-    if (existing && !enforceCampusAccess(req, res, existing.campusId)) {
+    if (!requireAdmin(req, res)) {
+      return;
+    }
+    if (!(await enforceRecordCampus(req, res, 'classes', id, existing?.campusId))) {
       return;
     }
 
@@ -2411,6 +2697,44 @@ app.post('/api/attendance/teacher', authenticateUser, async (req: Request, res: 
     updatedAt: new Date().toISOString(),
   };
 
+  if (serverSupabase) {
+    try {
+      // teacher_attendances.teacher_id references users(id), but the portal sends the
+      // teacher_profiles id (tch-...). Resolve it to the linked user id (usr-...).
+      let attendanceUserId = teacherId;
+      const { data: profileRow } = await serverSupabase
+        .from('teacher_profiles')
+        .select('teacher_id')
+        .eq('id', teacherId)
+        .maybeSingle();
+      if (profileRow?.teacher_id) {
+        attendanceUserId = profileRow.teacher_id;
+      }
+
+      const { error: attErr } = await serverSupabase.from('teacher_attendances').upsert([{
+        campus_id: campusId,
+        teacher_id: attendanceUserId,
+        date,
+        status: finalStatus,
+        check_in_time: new Date().toISOString(),
+        rule_applied: ruleApplied,
+        is_system_generated: isSystemGenerated,
+        remarks: remarks || null,
+        recorded_by: req.user?.fullName || 'Admin',
+        updated_at: new Date().toISOString(),
+      }], { onConflict: 'teacher_id,date' });
+      if (attErr) {
+        console.error('[Server Supabase] Teacher attendance upsert error:', attErr);
+        res.status(502).json({ error: `Teacher attendance was not saved to the database: ${attErr.message}` });
+        return;
+      }
+    } catch (err: any) {
+      console.error('[Server Supabase] Teacher attendance error:', err);
+      res.status(502).json({ error: `Teacher attendance was not saved to the database: ${err?.message || 'network error'}` });
+      return;
+    }
+  }
+
   const db = getDatabaseState() || {};
   const currentTchAttendance = db.teacherAttendance || [];
   const existingIdx = currentTchAttendance.findIndex((a: any) => a.teacherId === teacherId && a.date === date);
@@ -2421,27 +2745,6 @@ app.post('/api/attendance/teacher', authenticateUser, async (req: Request, res: 
   }
   db.teacherAttendance = currentTchAttendance;
   saveDatabaseState(db);
-
-  if (serverSupabase) {
-    try {
-      const { error: attErr } = await serverSupabase.from('teacher_attendances').upsert([{
-        campus_id: campusId,
-        teacher_id: teacherId,
-        date,
-        status: finalStatus,
-        check_in_time: new Date().toISOString(),
-        rule_applied: ruleApplied,
-        is_system_generated: isSystemGenerated,
-        remarks: remarks || null,
-        recorded_by: req.user?.fullName || 'Admin',
-      }], { onConflict: 'teacher_id,date' });
-      if (attErr) {
-        console.warn('[Server Supabase] Teacher attendance upsert error:', attErr);
-      }
-    } catch (err) {
-      console.warn('[Server Supabase] Teacher attendance error:', err);
-    }
-  }
 
   res.json({
     success: true,
@@ -2459,6 +2762,33 @@ app.post('/api/attendance/student/bulk', authenticateUser, async (req: Request, 
 
   if (!enforceCampusAccess(req, res, campusId)) {
     return;
+  }
+
+  if (serverSupabase) {
+    const sbRecords = records.map((rec: any) => ({
+      campus_id: campusId,
+      class_id: classId,
+      student_id: rec.studentId,
+      date: date,
+      status: rec.status,
+      remarks: rec.remarks || null,
+      recorded_by: req.user?.fullName || 'Teacher',
+      updated_at: new Date().toISOString(),
+    }));
+    try {
+      const { error: attErr } = await serverSupabase
+        .from('student_attendances')
+        .upsert(sbRecords, { onConflict: 'student_id,class_id,date' });
+      if (attErr) {
+        console.error('[Server Supabase] Student attendance upsert error:', attErr);
+        res.status(502).json({ error: `Student attendance was not saved to the database: ${attErr.message}` });
+        return;
+      }
+    } catch (err: any) {
+      console.error('[Server Supabase] Student attendance error:', err);
+      res.status(502).json({ error: `Student attendance was not saved to the database: ${err?.message || 'network error'}` });
+      return;
+    }
   }
 
   const db = getDatabaseState() || {};
@@ -2487,23 +2817,6 @@ app.post('/api/attendance/student/bulk', authenticateUser, async (req: Request, 
 
   db.studentAttendance = currentAttendance;
   saveDatabaseState(db);
-
-  if (serverSupabase) {
-    try {
-      const sbRecords = records.map((rec: any) => ({
-        campus_id: campusId,
-        class_id: classId,
-        student_id: rec.studentId,
-        date: date,
-        status: rec.status,
-        remarks: rec.remarks || null,
-        recorded_by: req.user?.fullName || 'Teacher',
-      }));
-      await serverSupabase.from('student_attendances').upsert(sbRecords, { onConflict: 'student_id,class_id,date' });
-    } catch {
-      // non-blocking
-    }
-  }
 
   res.json({
     success: true,
@@ -2569,64 +2882,83 @@ app.post('/api/users', authenticateUser, async (req: Request, res: Response) => 
       res.status(403).json({ error: 'Only Super Admin can create portal accounts.' });
       return;
     }
-    const { email, username, fullName, role, campusId, password, isActive, contactNumber } = req.body;
+    const { email, username, fullName, role, campusId, password, isActive, contactNumber } = req.body || {};
     if (!email || !username) {
       res.status(400).json({ error: 'Email and username are required.' });
       return;
     }
 
-    const cleanEmail = email.trim().toLowerCase();
-    const cleanUsername = username.trim().toLowerCase();
-    const parts = (fullName || '').trim().split(' ');
+    const cleanEmail = String(email).trim().toLowerCase();
+    const cleanUsername = String(username).trim().toLowerCase();
+    const cleanRole = String(role || 'TEACHER').toUpperCase();
+    const parts = String(fullName || '').trim().split(' ');
     const firstName = parts[0] || cleanUsername;
     const lastName = parts.slice(1).join(' ') || '';
     const userId = `usr-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
     if (serverSupabase) {
-      const { data: existing } = await serverSupabase
-        .from('users')
-        .select('id')
-        .or(`email.eq.${cleanEmail},username.eq.${cleanUsername}`)
-        .limit(1);
+      if (await authSvc.identifierTaken(serverSupabase, cleanEmail, cleanUsername)) {
+        res.status(400).json({ error: 'A user account with this email or username already exists.' });
+        return;
+      }
+      if (typeof password !== 'string' || password.length < 8) {
+        res.status(400).json({ error: 'An initial password of at least 8 characters is required.' });
+        return;
+      }
 
-      if (existing && existing.length > 0) {
-        res.status(400).json({ error: 'A user account with this email or username already exists in Supabase.' });
+      let authUserId: string;
+      try {
+        authUserId = await authSvc.createAuthAccount(serverSupabase, {
+          email: cleanEmail, password, appUserId: userId, role: cleanRole, isActive: isActive !== false,
+        });
+      } catch (authErr: any) {
+        res.status(400).json({ error: authErr.message });
         return;
       }
 
       const { error: userErr } = await serverSupabase.from('users').insert([{
         id: userId,
+        auth_user_id: authUserId,
         email: cleanEmail,
         username: cleanUsername,
         first_name: firstName,
         last_name: lastName,
-        password: password || 'Misbah2026!',
-        role: role || 'TEACHER',
+        role: cleanRole,
         active_campus_id: campusId === 'all' ? null : campusId,
-        allowed_campus_ids: campusId === 'all' ? ['all', 'uk', 'kts'] : [campusId],
+        allowed_campus_ids: authSvc.campusIdsFor(campusId),
         contact_number: contactNumber || null,
         status: isActive !== false ? 1 : 0,
       }]);
-
       if (userErr) {
+        await authSvc.deleteAuthAccount(serverSupabase, authUserId);
         res.status(500).json({ error: `Supabase user creation failed: ${userErr.message}` });
+        return;
+      }
+
+      try {
+        await authSvc.setCampusAccess(serverSupabase, userId, authSvc.campusIdsFor(campusId));
+      } catch (accessErr: any) {
+        await serverSupabase.from('users').delete().eq('id', userId);
+        await authSvc.deleteAuthAccount(serverSupabase, authUserId);
+        res.status(500).json({ error: accessErr.message });
         return;
       }
     }
 
-    const newUser = {
+    const newUser: any = {
       id: userId,
       email: cleanEmail,
       username: cleanUsername,
       fullName: fullName?.trim() || cleanUsername,
-      role: role || 'TEACHER',
+      role: cleanRole,
       campusId: campusId || 'all',
-      allowedCampusIds: campusId === 'all' ? ['all', 'uk', 'kts'] : [campusId],
+      allowedCampusIds: authSvc.campusIdsFor(campusId),
       isActive: isActive !== false,
-      password: password || 'Misbah2026!',
       contactNumber,
       createdAt: new Date().toISOString().substring(0, 10),
     };
+    // Local ledger mode only: keep the password for development logins.
+    if (!serverSupabase) newUser.password = password || 'Misbah2026!';
 
     const db = getDatabaseState() || {};
     db.users = [newUser, ...(db.users || []).filter((u: any) => u.id !== userId)];
@@ -2645,49 +2977,108 @@ app.put('/api/users/:id', authenticateUser, async (req: Request, res: Response) 
       return;
     }
     const { id } = req.params;
-    const updates = req.body;
+    const updates = req.body || {};
 
     if (serverSupabase) {
+      const { data: row, error: findErr } = await serverSupabase
+        .from('users').select('id, auth_user_id, email, role').eq('id', id).maybeSingle();
+      if (findErr || !row) {
+        res.status(404).json({ error: 'Portal account not found.' });
+        return;
+      }
+
+      const newEmail = updates.email !== undefined ? String(updates.email).trim().toLowerCase() : undefined;
+      const newUsername = updates.username !== undefined ? String(updates.username).trim().toLowerCase() : undefined;
+      if ((newEmail || newUsername) && await authSvc.identifierTaken(serverSupabase, newEmail || '', newUsername || '', id)) {
+        res.status(400).json({ error: 'Another account already uses that email or username.' });
+        return;
+      }
+
+      // Credentials and active status live in Supabase Auth.
+      try {
+        if (row.auth_user_id) {
+          await authSvc.updateAuthAccount(serverSupabase, row.auth_user_id, {
+            email: newEmail && newEmail !== row.email ? newEmail : undefined,
+            password: typeof updates.password === 'string' && updates.password ? updates.password : undefined,
+            isActive: updates.isActive,
+            role: updates.role ? String(updates.role).toUpperCase() : undefined,
+          });
+        } else if (typeof updates.password === 'string' && updates.password) {
+          const authUserId = await authSvc.createAuthAccount(serverSupabase, {
+            email: newEmail || row.email, password: updates.password, appUserId: id,
+            role: String(updates.role || row.role).toUpperCase(), isActive: updates.isActive,
+          });
+          await serverSupabase.from('users').update({ auth_user_id: authUserId }).eq('id', id);
+        }
+      } catch (authErr: any) {
+        res.status(400).json({ error: authErr.message });
+        return;
+      }
+
       const sbUpdates: any = { updated_at: new Date().toISOString() };
-      if (updates.email !== undefined) sbUpdates.email = updates.email.trim().toLowerCase();
-      if (updates.username !== undefined) sbUpdates.username = updates.username.trim().toLowerCase();
-      if (updates.role !== undefined) sbUpdates.role = updates.role;
+      if (newEmail !== undefined) sbUpdates.email = newEmail;
+      if (newUsername !== undefined) sbUpdates.username = newUsername;
+      if (updates.role !== undefined) sbUpdates.role = String(updates.role).toUpperCase();
       if (updates.campusId !== undefined) {
         sbUpdates.active_campus_id = updates.campusId === 'all' ? null : updates.campusId;
-        sbUpdates.allowed_campus_ids = updates.campusId === 'all' ? ['all', 'uk', 'kts'] : [updates.campusId];
+        sbUpdates.allowed_campus_ids = authSvc.campusIdsFor(updates.campusId);
       }
       if (updates.fullName !== undefined) {
-        const parts = updates.fullName.trim().split(' ');
+        const parts = String(updates.fullName).trim().split(' ');
         sbUpdates.first_name = parts[0] || '';
         sbUpdates.last_name = parts.slice(1).join(' ') || '';
       }
-      if (updates.isActive !== undefined) {
-        sbUpdates.status = updates.isActive ? 1 : 0;
-      }
-      if (updates.password !== undefined) {
-        sbUpdates.password = updates.password;
-      }
-      if (updates.contactNumber !== undefined) {
-        sbUpdates.contact_number = updates.contactNumber;
-      }
+      if (updates.isActive !== undefined) sbUpdates.status = updates.isActive ? 1 : 0;
+      if (updates.contactNumber !== undefined) sbUpdates.contact_number = updates.contactNumber;
 
       const { error: updErr } = await serverSupabase.from('users').update(sbUpdates).eq('id', id);
       if (updErr) {
         res.status(500).json({ error: `Supabase user update failed: ${updErr.message}` });
         return;
       }
+      if (updates.campusId !== undefined) {
+        await authSvc.setCampusAccess(serverSupabase, id, authSvc.campusIdsFor(updates.campusId));
+      }
     }
 
     const db = getDatabaseState() || {};
     const existing = (db.users || []).find((u: any) => u.id === id);
     if (existing) {
-      Object.assign(existing, updates);
+      const { password: _pw, ...safeUpdates } = updates;
+      Object.assign(existing, serverSupabase ? safeUpdates : updates);
       saveDatabaseState(db);
     }
 
     res.json({ success: true, message: 'User updated successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to update user.' });
+  }
+});
+
+// Super Admin password reset for another account.
+app.post('/api/users/:id/reset-password', authenticateUser, async (req: Request, res: Response) => {
+  try {
+    if (req.user?.role !== 'SUPER_ADMIN') {
+      res.status(403).json({ error: 'Only Super Admin can reset passwords.' });
+      return;
+    }
+    if (!serverSupabase) {
+      res.status(501).json({ error: 'Password resets require Supabase authentication.' });
+      return;
+    }
+    const { id } = req.params;
+    const { data: row } = await serverSupabase.from('users').select('id, auth_user_id, active_campus_id').eq('id', id).maybeSingle();
+    if (!row?.auth_user_id) {
+      res.status(404).json({ error: 'This account has no sign-in credentials to reset.' });
+      return;
+    }
+    const supplied = typeof req.body?.newPassword === 'string' ? req.body.newPassword.trim() : '';
+    const newPassword = supplied || `Misbah-${Math.random().toString(36).slice(2, 8)}${Math.floor(10 + Math.random() * 90)}!`;
+    await authSvc.updateAuthAccount(serverSupabase, row.auth_user_id, { password: newPassword });
+    await writeAuthAudit('PORTAL_USER_PASSWORD_RESET', row.active_campus_id, req.user.id, { target_user_id: id });
+    res.json({ success: true, newPassword });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to reset password.' });
   }
 });
 
@@ -2704,11 +3095,13 @@ app.delete('/api/users/:id', authenticateUser, async (req: Request, res: Respons
     }
 
     if (serverSupabase) {
+      const { data: row } = await serverSupabase.from('users').select('auth_user_id').eq('id', id).maybeSingle();
       const { error: delErr } = await serverSupabase.from('users').delete().eq('id', id);
       if (delErr) {
         res.status(500).json({ error: `Supabase user delete failed: ${delErr.message}` });
         return;
       }
+      await authSvc.deleteAuthAccount(serverSupabase, row?.auth_user_id);
     }
 
     const db = getDatabaseState() || {};
@@ -2738,6 +3131,7 @@ app.post('/api/payments', authenticateUser, async (req: Request, res: Response) 
         id: invoiceId,
         campus_id: targetCampus,
         reference_id: studentId || null,
+        student_id: studentId || null,
         type: 'fee_invoice',
         amount: Number(amountDue || 0),
         currency: currency || (targetCampus === 'uk' ? 'GBP' : 'PKR'),
@@ -2784,7 +3178,10 @@ app.put('/api/payments/:id/status', authenticateUser, async (req: Request, res: 
     const db = getDatabaseState() || {};
     const existing = (db.payments || []).find((p: any) => p.id === id);
 
-    if (existing && !enforceCampusAccess(req, res, existing.campusId)) {
+    if (!requireAdmin(req, res)) {
+      return;
+    }
+    if (!(await enforceRecordCampus(req, res, 'payment_invoices', id, existing?.campusId))) {
       return;
     }
 
@@ -2936,7 +3333,7 @@ app.post('/api/incidents', authenticateUser, async (req: Request, res: Response)
     // Supabase incident_logs persistence
     if (serverSupabase) {
       try {
-        await serverSupabase.from('incident_logs').upsert([{
+        const { error: sbWriteErr } = await serverSupabase.from('incident_logs').upsert([{
           id: incidentId,
           campus_id: campusId,
           student_id: studentId,
@@ -2949,8 +3346,11 @@ app.post('/api/incidents', authenticateUser, async (req: Request, res: Response)
           created_at: nowIso,
           updated_at: nowIso,
         }]);
-      } catch (sbErr) {
-        console.warn('[Server Supabase] incident_logs insert error:', sbErr);
+        if (sbWriteErr) throw sbWriteErr;
+      } catch (sbErr: any) {
+        console.error('[Server Supabase] incident_logs insert error:', sbErr);
+        res.status(502).json({ error: `Incident was not saved to the database: ${sbErr?.message || 'network error'}` });
+        return;
       }
     }
 
@@ -3063,7 +3463,7 @@ app.post('/api/medicals', authenticateUser, async (req: Request, res: Response) 
           reportedBy: user.fullName || user.email || 'Staff',
         });
 
-        await serverSupabase.from('incident_logs').upsert([{
+        const { error: sbWriteErr } = await serverSupabase.from('incident_logs').upsert([{
           id: medId,
           campus_id: campusId,
           student_id: studentId,
@@ -3075,14 +3475,17 @@ app.post('/api/medicals', authenticateUser, async (req: Request, res: Response) 
           created_at: nowIso,
           updated_at: nowIso,
         }]);
+        if (sbWriteErr) throw sbWriteErr;
 
-        // Also update students table in Supabase
-        await serverSupabase.from('students').update({
+        // Keep the student's summary medical notes in sync.
+        const { error: notesErr } = await serverSupabase.from('students').update({
           medical_notes: `Condition: ${condition}; Allergies: ${allergies || 'None'}; Emergency: ${emergencyContact || ''}`,
-          updated_at: nowIso,
         }).eq('id', studentId);
-      } catch (sbErr) {
-        console.warn('[Server Supabase] medical record sync error:', sbErr);
+        if (notesErr) throw notesErr;
+      } catch (sbErr: any) {
+        console.error('[Server Supabase] medical record sync error:', sbErr);
+        res.status(502).json({ error: `Medical record was not saved to the database: ${sbErr?.message || 'network error'}` });
+        return;
       }
     }
 
@@ -3113,10 +3516,10 @@ app.get('/api/documents', authenticateUser, async (req: Request, res: Response) 
     const db = getDatabaseState() || {};
     let docs: any[] = db.documents ? [...db.documents] : [];
 
-    // Query authoritative Supabase document_uplouds table
+    // Query authoritative Supabase documents table
     if (serverSupabase) {
       try {
-        let sbQuery = serverSupabase.from('document_uplouds').select('*');
+        let sbQuery = serverSupabase.from('documents').select('*');
         if (entityType) {
           sbQuery = sbQuery.eq('type', String(entityType).toLowerCase());
         }
@@ -3154,7 +3557,7 @@ app.get('/api/documents', authenticateUser, async (req: Request, res: Response) 
           });
         }
       } catch (sbErr) {
-        console.warn('[Server Supabase] document_uplouds fetch notice:', sbErr);
+        console.warn('[Server Supabase] documents fetch notice:', sbErr);
       }
     }
 
@@ -3355,7 +3758,7 @@ app.post('/api/documents/upload', authenticateUser, async (req: Request, res: Re
     // Authoritative Supabase Database & Storage synchronization
     if (serverSupabase) {
       try {
-        await serverSupabase.from('document_uplouds').upsert([{
+        const { error: sbWriteErr } = await serverSupabase.from('documents').upsert([{
           id: docId,
           campus_id: targetCampus,
           type: entityType.toLowerCase(),
@@ -3365,8 +3768,11 @@ app.post('/api/documents/upload', authenticateUser, async (req: Request, res: Re
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         }]);
-      } catch (dbDocErr) {
-        console.warn('[Server Supabase] document_uplouds upsert notice:', dbDocErr);
+        if (sbWriteErr) throw sbWriteErr;
+      } catch (dbDocErr: any) {
+        console.error('[Server Supabase] documents upsert notice:', dbDocErr);
+        res.status(502).json({ error: `Document record was not saved to the database: ${dbDocErr?.message || 'network error'}` });
+        return;
       }
 
       // Record audit log entry in Supabase
@@ -3531,7 +3937,7 @@ app.delete('/api/documents/:id', authenticateUser, async (req: Request, res: Res
       return;
     }
 
-    // Delete from Supabase Storage and document_uplouds table
+    // Delete from Supabase Storage and documents table
     if (serverSupabase) {
       if (doc.storageBucket && doc.storagePath) {
         try {
@@ -3541,9 +3947,9 @@ app.delete('/api/documents/:id', authenticateUser, async (req: Request, res: Res
         }
       }
       try {
-        await serverSupabase.from('document_uplouds').delete().eq('id', id);
+        await serverSupabase.from('documents').delete().eq('id', id);
       } catch (err) {
-        console.warn('[Server Database] document_uplouds deletion notice:', err);
+        console.warn('[Server Database] documents deletion notice:', err);
       }
     }
 

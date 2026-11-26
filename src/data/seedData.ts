@@ -92,7 +92,7 @@ export const INITIAL_USERS: (UserSession & {
     campusId: 'all',
     allowedCampusIds: ['all', 'uk', 'kts'],
     isActive: true,
-    password: 'Adminmisbah@123',
+    password: (import.meta as any).env?.VITE_LOCAL_DEMO_PASSWORD || '', // local ledger mode only
     token: 'jwt-superadmin-master',
     createdAt: '2026-01-01',
     lastLogin: '2026-10-26 10:00',
@@ -107,7 +107,7 @@ export const INITIAL_USERS: (UserSession & {
     campusId: 'uk',
     allowedCampusIds: ['uk'],
     isActive: true,
-    password: 'Adminmisbah@123',
+    password: (import.meta as any).env?.VITE_LOCAL_DEMO_PASSWORD || '', // local ledger mode only
     token: 'jwt-usr-admin-uk-01-master',
     createdAt: '2026-01-01',
     lastLogin: '2026-10-26 10:00',
@@ -122,7 +122,7 @@ export const INITIAL_USERS: (UserSession & {
     campusId: 'kts',
     allowedCampusIds: ['kts'],
     isActive: true,
-    password: 'Adminmisbah@123',
+    password: (import.meta as any).env?.VITE_LOCAL_DEMO_PASSWORD || '', // local ledger mode only
     token: 'jwt-usr-admin-kts-01-master',
     createdAt: '2026-01-01',
     lastLogin: '2026-10-26 10:00',

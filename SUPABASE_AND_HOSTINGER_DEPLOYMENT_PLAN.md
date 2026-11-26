@@ -1,3 +1,5 @@
+> **⚠️ OUTDATED (superseded on 2026-11-26).** Do not follow the setup steps below — running `supabase/schema.sql` or `supabase/rls_policies.sql` (now in `supabase/migrations/_legacy/`) would disable Row Level Security and expose user data. Current documentation: [docs/database/SCHEMA.md](docs/database/SCHEMA.md), [docs/database/MIGRATIONS.md](docs/database/MIGRATIONS.md), [docs/database/BACKUP_RECOVERY.md](docs/database/BACKUP_RECOVERY.md).
+
 # Misbah-ul-Quran IMS — Supabase Backend & Hostinger Deployment Plan
 
 This master guide provides a production-grade, step-by-step implementation plan for connecting the **Misbah-ul-Quran International Institute Management System (IMS)** to **Supabase (PostgreSQL)** and deploying the application on **Hostinger**.

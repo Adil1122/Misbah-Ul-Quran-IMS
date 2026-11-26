@@ -33,7 +33,7 @@ import {
   getCampusCurrentTime,
   validateTeacherAttendanceSubmission,
 } from '../utils/teacherAttendanceRules.ts';
-import { SupabaseDbService, isSupabaseConfigured } from './supabaseClient.ts';
+import { SupabaseDbService, isSupabaseConfigured, supabase } from './supabaseClient.ts';
 import {
   INITIAL_CAMPUSES,
   INITIAL_USERS,
@@ -72,12 +72,7 @@ export class IMSStateService {
                 const seedSuper = (fallback as any[])?.find((u: any) => u.role === 'SUPER_ADMIN' && u.username === 'superadmin');
                 if (seedSuper) {
                   const superIdx = parsed.findIndex((u: any) => u.role === 'SUPER_ADMIN' && u.username === 'superadmin');
-                  if (superIdx >= 0) {
-                    if (parsed[superIdx].password !== seedSuper.password) {
-                      parsed[superIdx].password = seedSuper.password;
-                      localStorage.setItem(`misbah_${key}`, JSON.stringify(parsed));
-                    }
-                  } else {
+                  if (superIdx < 0) {
                     parsed.unshift(seedSuper);
                     localStorage.setItem(`misbah_${key}`, JSON.stringify(parsed));
                   }
@@ -152,12 +147,11 @@ export class IMSStateService {
       if (stored) {
         const parsed = JSON.parse(stored);
         if (parsed && parsed.id && parsed.role) {
-          if (!parsed.token) {
-            const seed = (INITIAL_USERS as any[]).find((u) => u.id === parsed.id || u.username === parsed.username);
-            if (seed?.token) {
-              parsed.token = seed.token;
-              localStorage.setItem('misbah_current_user', JSON.stringify(parsed));
-            }
+          const looksLikeJwt = typeof parsed.token === 'string' && parsed.token.split('.').length === 3;
+          if (isSupabaseConfigured && !looksLikeJwt) {
+            // Session from the old client-side login: force a fresh, server-verified sign-in.
+            localStorage.removeItem('misbah_current_user');
+            return null;
           }
           return parsed;
         }
@@ -171,6 +165,31 @@ export class IMSStateService {
   // Current session (defaults to null until authenticated)
   private static currentUser: UserSession | null = IMSStateService.getInitialSession();
   private static listeners: (() => void)[] = [];
+  private static authListenerAttached: boolean = IMSStateService.attachAuthListener();
+
+  private static attachAuthListener(): boolean {
+    if (!supabase || typeof window === 'undefined') return false;
+    supabase.auth.onAuthStateChange((event, session) => {
+      if (session?.access_token && IMSStateService.currentUser) {
+        IMSStateService.currentUser.token = session.access_token;
+        try {
+          localStorage.setItem('misbah_current_user', JSON.stringify(IMSStateService.currentUser));
+        } catch {
+          // ignore
+        }
+      }
+      if (event === 'SIGNED_OUT' && IMSStateService.currentUser) {
+        IMSStateService.currentUser = null;
+        try {
+          localStorage.removeItem('misbah_current_user');
+        } catch {
+          // ignore
+        }
+        IMSStateService.notify();
+      }
+    });
+    return true;
+  }
 
   static subscribe(listener: () => void): () => void {
     this.listeners.push(listener);
@@ -187,42 +206,18 @@ export class IMSStateService {
     if (this.currentUser?.token && typeof this.currentUser.token === 'string' && this.currentUser.token.trim()) {
       return this.currentUser.token.trim();
     }
-
     try {
       if (typeof window !== 'undefined') {
         const stored = localStorage.getItem('misbah_current_user');
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (parsed?.token && typeof parsed.token === 'string' && parsed.token.trim()) {
-            if (this.currentUser && !this.currentUser.token) {
-              this.currentUser.token = parsed.token.trim();
-            }
-            return parsed.token.trim();
-          }
-          if (parsed?.id) {
-            const user = this.users.find((u) => u.id === parsed.id || u.username === parsed.username);
-            if (user?.token) {
-              parsed.token = user.token;
-              localStorage.setItem('misbah_current_user', JSON.stringify(parsed));
-              if (this.currentUser) {
-                this.currentUser.token = user.token;
-              }
-              return user.token;
-            }
-            const seed = (INITIAL_USERS as any[]).find((u) => u.id === parsed.id || u.username === parsed.username);
-            if (seed?.token) {
-              parsed.token = seed.token;
-              localStorage.setItem('misbah_current_user', JSON.stringify(parsed));
-              if (this.currentUser) {
-                this.currentUser.token = seed.token;
-              }
-              return seed.token;
-            }
-          }
+        const parsed = stored ? JSON.parse(stored) : null;
+        if (parsed?.token && typeof parsed.token === 'string' && parsed.token.trim()) {
+          if (this.currentUser && !this.currentUser.token) this.currentUser.token = parsed.token.trim();
+          return parsed.token.trim();
         }
       }
-    } catch {}
-
+    } catch {
+      // ignore
+    }
     return null;
   }
 
@@ -389,12 +384,10 @@ export class IMSStateService {
             role: u.role,
             campusId: u.active_campus_id,
             isActive: u.status === 1 || u.status === true,
-            password: u.password || 'admin123',
             studentId: u.student_id,
             teacherProfileId: u.teacher_profile_id,
             parentProfileId: u.parent_profile_id,
             allowedCampusIds: Array.isArray(u.allowed_campus_ids) ? u.allowed_campus_ids : ['all', 'uk', 'kts'],
-            token: u.token,
             createdAt: u.created_at ? new Date(u.created_at).toISOString().split('T')[0] : '2026-01-10',
             lastLogin: '2026-10-15 08:30',
           };
@@ -471,7 +464,7 @@ export class IMSStateService {
             campusId: c.campus_id || 'uk',
             name: className,
             code: c.code || `${c.campus_id?.toUpperCase() || 'CLS'}-${c.id}`,
-            gradeLevel: c.description || (className.includes('Boys') ? 'Boys Section' : className.includes('Girls') ? 'Girls Section' : 'General Section'),
+            gradeLevel: c.grade_level || c.description || (className.includes('Boys') ? 'Boys Section' : className.includes('Girls') ? 'Girls Section' : 'General Section'),
             section: c.section || (className.includes('Boys') ? 'Boys' : className.includes('Girls') ? 'Girls' : 'General'),
             academicYear: c.academic_year || '2025-2026',
             capacity: Number(c.capacity || 25),
@@ -581,14 +574,16 @@ export class IMSStateService {
         const dbTeacherAtt = await SupabaseDbService.fetchTeacherAttendance();
         if (dbTeacherAtt && dbTeacherAtt.length > 0) {
           dbTeacherAtt.forEach((a: any) => {
-            const existingIdx = this.teacherAttendance.findIndex(
-              (x) => x.teacherId === a.teacher_id && x.date === a.date
-            );
+            // Supabase stores the user id (usr-...); the portal keys attendance by profile id (tch-...).
             const teacher = this.teachers.find((t) => t.id === a.teacher_id || t.userId === a.teacher_id);
+            const portalTeacherId = teacher?.id || a.teacher_id;
+            const existingIdx = this.teacherAttendance.findIndex(
+              (x) => (x.teacherId === portalTeacherId || x.teacherId === a.teacher_id) && x.date === a.date
+            );
             const entry: TeacherAttendanceRecord = {
               id: a.id || `att-tch-${a.teacher_id}-${a.date}`,
               campusId: a.campus_id || 'uk',
-              teacherId: a.teacher_id,
+              teacherId: portalTeacherId,
               teacherName: teacher?.fullName || 'Faculty Member',
               teacherCode: teacher?.employeeCode || `TCH-${a.teacher_id}`,
               date: a.date,
@@ -1082,7 +1077,7 @@ export class IMSStateService {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${this.currentUser?.token || 'adm-token'}`,
+          'Authorization': `Bearer ${this.getValidAccessToken() || ''}`,
         },
         body: JSON.stringify(data),
       });
@@ -1123,7 +1118,7 @@ export class IMSStateService {
       const res = await fetch(`/api/documents/${docId}`, {
         method: 'DELETE',
         headers: {
-          'Authorization': `Bearer ${this.currentUser?.token || 'adm-token'}`,
+          'Authorization': `Bearer ${this.getValidAccessToken() || ''}`,
         },
       });
       const resData = await res.json();
@@ -1239,20 +1234,69 @@ export class IMSStateService {
     return this.currentUser;
   }
 
-  static login(identifier: string, password: string): { success: boolean; message: string; user?: UserSession } {
+  static async login(identifier: string, password: string): Promise<{ success: boolean; message: string; user?: UserSession }> {
+    if (!isSupabaseConfigured) return this.loginLocal(identifier, password);
+
+    let response: Response;
+    try {
+      response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ identifier: identifier.trim(), password }),
+      });
+    } catch {
+      return { success: false, message: 'Cannot reach the server. Check your connection and try again.' };
+    }
+    const body = await response.json().catch(() => ({}));
+    if (response.status === 501) return this.loginLocal(identifier, password);
+    if (!response.ok || !body?.success || !body.session?.access_token) {
+      return { success: false, message: body?.error || 'Sign-in failed. Please try again.' };
+    }
+
+    if (supabase) {
+      const { error } = await supabase.auth.setSession({
+        access_token: body.session.access_token,
+        refresh_token: body.session.refresh_token,
+      });
+      if (error) {
+        return { success: false, message: `Could not start your session: ${error.message}` };
+      }
+    }
+
+    const u = body.user || {};
+    this.currentUser = {
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      fullName: u.fullName,
+      role: u.role,
+      allowedCampusIds: u.allowedCampusIds || [u.activeCampusId || 'all'],
+      activeCampusId: u.activeCampusId || 'all',
+      teacherProfileId: u.teacherProfileId,
+      token: body.session.access_token,
+    };
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.setItem('misbah_current_user', JSON.stringify(this.currentUser));
+      }
+    } catch {
+      // ignore
+    }
+    this.branchImpersonation = { isImpersonating: false, campusId: null };
+    this.notify();
+    return { success: true, message: 'Authentication successful', user: this.currentUser };
+  }
+
+  /** Development-only login used when Supabase is not configured (local ledger mode). */
+  private static loginLocal(identifier: string, password: string): { success: boolean; message: string; user?: UserSession } {
     const cleanId = identifier.trim().toLowerCase();
     const userFound = this.users.find(
       (u) =>
         (u.email.toLowerCase() === cleanId ||
           u.username.toLowerCase() === cleanId) &&
-        (u.password === password ||
-          (u.role === 'SUPER_ADMIN' && password === INITIAL_USERS[0]?.password))
+        Boolean(u.password) &&
+        u.password === password
     );
-
-    if (userFound && userFound.role === 'SUPER_ADMIN' && INITIAL_USERS[0]?.password && userFound.password !== INITIAL_USERS[0].password) {
-      userFound.password = INITIAL_USERS[0].password;
-      this.persist('users', this.users);
-    }
 
     if (!userFound) {
       this.addAuditLog({
@@ -1367,19 +1411,24 @@ export class IMSStateService {
     } catch {
       // ignore
     }
+    if (supabase) {
+      supabase.auth.signOut().catch(() => {
+        // ignore network errors on sign-out
+      });
+    }
     this.currentUser = null;
     this.branchImpersonation = { isImpersonating: false, campusId: null };
     this.notify();
   }
 
   // Update currently authenticated user's profile and password
-  static updateCurrentProfile(data: {
+  static async updateCurrentProfile(data: {
     fullName?: string;
     email?: string;
     username?: string;
     currentPassword?: string;
     newPassword?: string;
-  }): { success: boolean; message: string; user?: UserSession } {
+  }): Promise<{ success: boolean; message: string; user?: UserSession }> {
     if (!this.currentUser) {
       return { success: false, message: 'No active session found.' };
     }
@@ -1394,10 +1443,26 @@ export class IMSStateService {
       if (!data.currentPassword) {
         return { success: false, message: 'Please enter your current password to set a new password.' };
       }
-      if (userFound.password !== data.currentPassword) {
-        return { success: false, message: 'Current password entered is incorrect.' };
+      if (isSupabaseConfigured) {
+        try {
+          const response = await fetch('/api/auth/change-password', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+            body: JSON.stringify({ currentPassword: data.currentPassword, newPassword: data.newPassword.trim() }),
+          });
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok || !body?.success) {
+            return { success: false, message: body?.error || 'Failed to change password.' };
+          }
+        } catch {
+          return { success: false, message: 'Cannot reach the server to change your password.' };
+        }
+      } else {
+        if (userFound.password !== data.currentPassword) {
+          return { success: false, message: 'Current password entered is incorrect.' };
+        }
+        userFound.password = data.newPassword.trim();
       }
-      userFound.password = data.newPassword.trim();
     }
 
     if (data.fullName && data.fullName.trim()) {
@@ -1589,7 +1654,7 @@ export class IMSStateService {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify(updates),
     }).catch((err) => {
@@ -1628,8 +1693,10 @@ export class IMSStateService {
   }
 
   static getClasses(campusFilter?: string): ClassRoom[] {
-    if (!campusFilter || campusFilter === 'all') return this.classes;
-    return this.classes.filter((c) => c.campusId === campusFilter);
+    // Deactivated classes (e.g. merged duplicates) are hidden from lists and dropdowns.
+    const active = this.classes.filter((c) => c.isActive !== false);
+    if (!campusFilter || campusFilter === 'all') return active;
+    return active.filter((c) => c.campusId === campusFilter);
   }
 
   static getClassById(id: string): ClassRoom | undefined {
@@ -2316,7 +2383,7 @@ export class IMSStateService {
     return this.users.find((u) => u.id === id);
   }
 
-  static createUser(accountData: Omit<UserAccount, 'id' | 'createdAt'>): { success: boolean; message: string; user?: UserAccount } {
+  static async createUser(accountData: Omit<UserAccount, 'id' | 'createdAt'>): Promise<{ success: boolean; message: string; user?: UserAccount }> {
     const cleanEmail = accountData.email.trim().toLowerCase();
     const cleanUsername = accountData.username.trim().toLowerCase();
 
@@ -2331,17 +2398,44 @@ export class IMSStateService {
       };
     }
 
-    const newUser: UserAccount & { allowedCampusIds?: string[]; token?: string } = {
-      ...accountData,
-      id: `usr-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    let serverUserId: string | undefined;
+    if (isSupabaseConfigured) {
+      try {
+        const response = await fetch('/api/users', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+          body: JSON.stringify({
+            email: cleanEmail,
+            username: accountData.username.trim(),
+            fullName: accountData.fullName,
+            role: accountData.role,
+            campusId: accountData.campusId,
+            password: accountData.password,
+            isActive: accountData.isActive !== false,
+          }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body?.success) {
+          return { success: false, message: body?.error || 'The server could not create this account.' };
+        }
+        serverUserId = body.user?.id;
+      } catch {
+        return { success: false, message: 'Cannot reach the server to create this account.' };
+      }
+    }
+
+    const { password: initialPassword, ...accountWithoutPassword } = accountData;
+    const newUser: UserAccount & { allowedCampusIds?: string[] } = {
+      ...accountWithoutPassword,
+      id: serverUserId || `usr-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       email: cleanEmail,
       username: accountData.username.trim(),
       isActive: accountData.isActive !== false,
-      password: accountData.password || 'Misbah2026!',
       createdAt: new Date().toISOString().substring(0, 10),
       allowedCampusIds: accountData.campusId === 'all' ? ['all', 'uk', 'kts'] : [accountData.campusId],
-      token: `jwt-${Date.now()}`,
     };
+    // Local ledger mode only: the browser keeps the password for development logins.
+    if (!isSupabaseConfigured) newUser.password = initialPassword || 'Misbah2026!';
 
     this.users.unshift(newUser);
 
@@ -2356,42 +2450,11 @@ export class IMSStateService {
       details: `Created new ${newUser.role} portal login for ${newUser.fullName} (${newUser.username})`,
     });
 
-    fetch('/api/users', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
-      },
-      body: JSON.stringify({
-        email: newUser.email,
-        username: newUser.username,
-        fullName: newUser.fullName,
-        role: newUser.role,
-        campusId: newUser.campusId,
-        password: newUser.password,
-        isActive: newUser.isActive,
-      }),
-    }).catch((err) => {
-      console.warn('[User Sync] Notice saving user via API:', err);
-      if (isSupabaseConfigured) {
-        SupabaseDbService.insertUser({
-          id: newUser.id,
-          email: newUser.email,
-          username: newUser.username,
-          role: newUser.role,
-          active_campus_id: newUser.campusId === 'all' ? null : newUser.campusId,
-          first_name: newUser.fullName?.split(' ')[0] || newUser.fullName,
-          last_name: newUser.fullName?.split(' ').slice(1).join(' ') || '',
-          status: newUser.isActive ? 1 : 0,
-        }).catch((sbErr) => console.warn('[Supabase Sync] Insert user error:', sbErr));
-      }
-    });
-
     this.notify();
     return { success: true, message: 'Portal account created successfully!', user: newUser };
   }
 
-  static updateUser(id: string, updates: Partial<UserAccount>): { success: boolean; message: string } {
+  static async updateUser(id: string, updates: Partial<UserAccount>): Promise<{ success: boolean; message: string }> {
     const userIndex = this.users.findIndex((u) => u.id === id);
     if (userIndex < 0) return { success: false, message: 'Portal user not found.' };
 
@@ -2410,9 +2473,26 @@ export class IMSStateService {
       }
     }
 
+    if (isSupabaseConfigured) {
+      try {
+        const response = await fetch(`/api/users/${id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+          body: JSON.stringify(updates),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body?.success) {
+          return { success: false, message: body?.error || 'The server could not update this account.' };
+        }
+      } catch {
+        return { success: false, message: 'Cannot reach the server to update this account.' };
+      }
+    }
+
+    const { password: _newPassword, ...updatesWithoutPassword } = updates;
     this.users[userIndex] = {
       ...oldUser,
-      ...updates,
+      ...(isSupabaseConfigured ? updatesWithoutPassword : updates),
       allowedCampusIds: updates.campusId ? (updates.campusId === 'all' ? ['all', 'uk', 'kts'] : [updates.campusId]) : oldUser.allowedCampusIds,
     };
 
@@ -2425,26 +2505,6 @@ export class IMSStateService {
       entityType: 'UserAccount',
       entityId: id,
       details: `Updated portal account details for ${this.users[userIndex].fullName} (${this.users[userIndex].username})`,
-    });
-
-    fetch(`/api/users/${id}`, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
-      },
-      body: JSON.stringify(updates),
-    }).catch((err) => {
-      console.warn('[User Sync] Notice updating user via API:', err);
-      if (isSupabaseConfigured) {
-        SupabaseDbService.updateUser(id, {
-          email: updates.email,
-          username: updates.username,
-          role: updates.role,
-          active_campus_id: updates.campusId === 'all' ? null : updates.campusId,
-          status: updates.isActive !== undefined ? (updates.isActive ? 1 : 0) : undefined,
-        }).catch((sbErr) => console.warn('[Supabase Sync] Update user error:', sbErr));
-      }
     });
 
     this.notify();
@@ -2475,7 +2535,7 @@ export class IMSStateService {
     fetch(`/api/users/${id}`, {
       method: 'DELETE',
       headers: {
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
     }).catch((err) => {
       console.warn('[User Sync] Notice deleting user via API:', err);
@@ -2490,12 +2550,29 @@ export class IMSStateService {
     return { success: true, message: 'Portal account removed successfully.' };
   }
 
-  static resetUserPassword(id: string, newPassword?: string): { success: boolean; message: string; newPassword: string } {
+  static async resetUserPassword(id: string, newPassword?: string): Promise<{ success: boolean; message: string; newPassword: string }> {
     const user = this.users.find((u) => u.id === id);
     if (!user) return { success: false, message: 'User not found.', newPassword: '' };
 
-    const pwd = newPassword || `Misbah${Math.floor(1000 + Math.random() * 9000)}!`;
-    user.password = pwd;
+    let pwd = newPassword || `Misbah${Math.floor(1000 + Math.random() * 9000)}!`;
+    if (isSupabaseConfigured) {
+      try {
+        const response = await fetch(`/api/users/${id}/reset-password`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+          body: JSON.stringify({ newPassword }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok || !body?.success) {
+          return { success: false, message: body?.error || 'Password reset failed.', newPassword: '' };
+        }
+        pwd = body.newPassword;
+      } catch {
+        return { success: false, message: 'Cannot reach the server to reset the password.', newPassword: '' };
+      }
+    } else {
+      user.password = pwd;
+    }
 
     this.addAuditLog({
       campusId: user.campusId === 'all' ? undefined : user.campusId,
@@ -2532,6 +2609,21 @@ export class IMSStateService {
       entityId: id,
       details: `Changed account status for ${user.fullName} to ${user.isActive ? 'ACTIVE' : 'SUSPENDED'}`,
     });
+
+    if (isSupabaseConfigured) {
+      fetch(`/api/users/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+        body: JSON.stringify({ isActive: user.isActive }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            console.error('[User Sync] Server did not change account status:', body?.error || response.status);
+          }
+        })
+        .catch((err) => console.error('[User Sync] Account status change failed:', err));
+    }
 
     this.notify();
     return { success: true, isActive: user.isActive };
@@ -3277,7 +3369,7 @@ export class IMSStateService {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify({
         campusId: params.campusId,
@@ -3287,12 +3379,18 @@ export class IMSStateService {
         checkInTime: record.checkInTime,
         remarks: record.remarks,
       }),
+    }).then(async (response) => {
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        console.error('[Teacher Attendance Sync] Server did not save attendance:', body?.error || response.status);
+      }
     }).catch((err) => {
       console.warn('[Teacher Attendance Sync] Notice dispatching to server:', err);
       if (isSupabaseConfigured) {
+        const linkedTeacher = this.teachers.find((t) => t.id === params.teacherId);
         SupabaseDbService.saveTeacherAttendance({
           campus_id: params.campusId,
-          teacher_id: params.teacherId,
+          teacher_id: linkedTeacher?.userId || params.teacherId,
           date: params.date,
           status: record.status,
           check_in_time: record.checkInTime,
@@ -3361,7 +3459,7 @@ export class IMSStateService {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify({
         campusId,
@@ -3577,7 +3675,7 @@ export class IMSStateService {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify(newIncident),
     }).catch((err) => {
@@ -3625,7 +3723,7 @@ export class IMSStateService {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify({ status, reviewNotes }),
     }).catch((err) => {
@@ -3798,7 +3896,7 @@ export class IMSStateService {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify({
         status,
@@ -3983,7 +4081,7 @@ export class IMSStateService {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.currentUser?.token || 'adm-token'}`,
+        Authorization: `Bearer ${this.getValidAccessToken() || ''}`,
       },
       body: JSON.stringify(med),
     }).catch((err) => {

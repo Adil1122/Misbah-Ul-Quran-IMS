@@ -14,7 +14,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess }) => {
   const [errorMessage, setErrorMessage] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
 
@@ -24,15 +24,16 @@ export const LoginView: React.FC<LoginViewProps> = ({ onLoginSuccess }) => {
     }
 
     setIsLoading(true);
-    setTimeout(() => {
-      const res = IMSStateService.login(identifier, password);
-      setIsLoading(false);
+    try {
+      const res = await IMSStateService.login(identifier, password);
       if (res.success) {
         onLoginSuccess();
       } else {
         setErrorMessage(res.message);
       }
-    }, 400);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const [isForgotModalOpen, setIsForgotModalOpen] = useState(false);

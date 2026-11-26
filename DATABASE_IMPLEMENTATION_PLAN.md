@@ -1,3 +1,5 @@
+> **⚠️ OUTDATED (superseded on 2026-11-26).** Do not follow the setup steps below — running `supabase/schema.sql` or `supabase/rls_policies.sql` (now in `supabase/migrations/_legacy/`) would disable Row Level Security and expose user data. Current documentation: [docs/database/SCHEMA.md](docs/database/SCHEMA.md), [docs/database/MIGRATIONS.md](docs/database/MIGRATIONS.md), [docs/database/BACKUP_RECOVERY.md](docs/database/BACKUP_RECOVERY.md).
+
 # Misbah-ul-Quran IMS — Database Architecture & Implementation Plan
 
 A comprehensive, phased technical roadmap for transitioning the **Misbah-ul-Quran International Institute Management System (IMS)** from local in-memory state to a production relational/persistent database.

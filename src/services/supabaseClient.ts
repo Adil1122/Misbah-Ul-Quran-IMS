@@ -150,7 +150,8 @@ export class SupabaseDbService {
   // ============================================================================
   static async fetchStudents(campusId?: string): Promise<any[] | null> {
     if (!supabase) return null;
-    let query = supabase.from('students').select('*').order('first_name');
+    // Archived (soft-deleted) students are excluded from the app.
+    let query = supabase.from('students').select('*').neq('status', 'archived').order('first_name');
     if (campusId && campusId !== 'all') {
       query = query.eq('campus_id', campusId);
     }
@@ -556,7 +557,7 @@ export class SupabaseDbService {
   }): Promise<DbResult> {
     try {
       // 1. Authoritative Backend Proxy (Bypasses client anon RLS restriction safely on server)
-      let userToken = 'adm-token';
+      let userToken = '';
       try {
         if (typeof window !== 'undefined') {
           const stored = localStorage.getItem('misbah_current_user');

@@ -66,7 +66,7 @@ export const PortalAccountModal: React.FC<PortalAccountModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!fullName.trim()) {
       setError('Full Name is required.');
@@ -82,14 +82,14 @@ export const PortalAccountModal: React.FC<PortalAccountModalProps> = ({
     }
 
     if (isEditing && accountToEdit) {
-      const res = IMSStateService.updateUser(accountToEdit.id, {
+      const res = await IMSStateService.updateUser(accountToEdit.id, {
         fullName: fullName.trim(),
         username: username.trim(),
         email: email.trim(),
         role,
         campusId,
         isActive,
-        password: password.trim() || accountToEdit.password,
+        password: password.trim() || undefined,
       });
 
       if (res.success) {
@@ -100,7 +100,7 @@ export const PortalAccountModal: React.FC<PortalAccountModalProps> = ({
         setError(res.message);
       }
     } else {
-      const res = IMSStateService.createUser({
+      const res = await IMSStateService.createUser({
         fullName: fullName.trim(),
         username: username.trim(),
         email: email.trim(),
