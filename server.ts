@@ -99,7 +99,7 @@ function getValidSupabaseServiceKey(...candidates: (string | undefined)[]): stri
  * Safely extracts host from a URL string without exposing any credentials, secrets, or tokens.
  */
 function getSafeHost(urlStr?: string): string {
-  if (!urlStr) return 'none (local ledger mode)';
+  if (!urlStr) return 'none (not configured)';
   try {
     const parsed = new URL(urlStr);
     return parsed.host;
@@ -259,51 +259,8 @@ const authenticateUser = async (req: Request, res: Response, next: NextFunction)
       return;
     }
 
-    // Local ledger mode (Supabase NOT configured) — development only.
-    const db = getDatabaseState();
-    const localUsers: any[] = db?.users || [];
-
-    // Extract potential user ID from token safely (e.g. jwt-usr-admin-kts-01-1793171829 -> usr-admin-kts-01)
-    const extractedId = token.startsWith('jwt-')
-      ? token.replace(/^jwt-/, '').replace(/-\d+$/, '')
-      : token;
-
-    // 1. Look up token or user ID in local database ledger
-    let matchedUser = localUsers.find(
-      (u) =>
-        u.token === token ||
-        u.id === extractedId ||
-        (token.startsWith('jwt-') && token.includes(u.id)) ||
-        u.email?.toLowerCase() === extractedId.toLowerCase() ||
-        u.username?.toLowerCase() === extractedId.toLowerCase()
-    );
-
-    if (!matchedUser) {
-      res.status(401).json({
-        error: 'Unauthorized: Invalid, unrecognized, or expired credentials.',
-        code: 'INVALID_CREDENTIALS',
-      });
-      return;
-    }
-
-    if (matchedUser.isActive === false) {
-      res.status(403).json({
-        error: 'Forbidden: Account has been deactivated or suspended by administration.',
-        code: 'ACCOUNT_SUSPENDED',
-      });
-      return;
-    }
-
-    req.user = {
-      id: matchedUser.id,
-      email: matchedUser.email,
-      fullName: matchedUser.fullName || `${matchedUser.firstName || ''} ${matchedUser.lastName || ''}`.trim() || matchedUser.email,
-      role: matchedUser.role,
-      activeCampusId: matchedUser.campusId || matchedUser.activeCampusId || 'all',
-      allowedCampusIds: matchedUser.allowedCampusIds || [matchedUser.campusId || 'all'],
-    };
-
-    next();
+    // No database connection: nothing can be verified (the /api guard normally answers 503 first).
+    res.status(503).json({ error: 'Authentication unavailable: database not connected.', code: 'DATABASE_UNAVAILABLE' });
   } catch (err: any) {
     console.error('[Server Auth Guard] Exception evaluating credentials:', err);
     res.status(500).json({ error: 'Internal authentication service error.' });
@@ -321,7 +278,7 @@ app.get('/api/health', (req: Request, res: Response) => {
     timestamp: new Date().toISOString(),
     uptimeSeconds: Math.round(process.uptime()),
     database: {
-      provider: serverSupabase ? 'Supabase PostgreSQL' : 'Local JSON Ledger Cache',
+      provider: serverSupabase ? 'Supabase PostgreSQL' : 'unavailable',
       supabaseConnected: Boolean(serverSupabase),
       supabaseProjectHost: getSafeHost(serverSupabaseUrl),
       serviceRoleKeyConfigured: Boolean(serverSupabaseKey),
@@ -346,24 +303,14 @@ app.get(['/api/database/diagnostics', '/api/diagnostics'], (req: Request, res: R
 });
 
 // ==============================================================================
-// 2.1 PERSISTENT DATABASE ENGINE (Local JSON Ledger + Supabase Cloud Bridge)
+// 2.1 DATA ACCESS — Supabase is the only data store
 // ==============================================================================
-// Collections whose source of truth is Supabase (all of them). Used by the state loader.
+// Collections returned by the state loader. Used to reset them before a reload.
 const SUPABASE_BACKED_KEYS = [
   'campuses', 'users', 'teachers', 'classes', 'students', 'payments',
   'teacherAttendance', 'studentAttendance', 'incidents', 'medicalRecords', 'auditLogs',
 ];
 
-// The local JSON ledger (data/ims_database.json) has been retired: Supabase is the only
-// data store. These inert shims keep older call sites harmless while they are cleaned up;
-// they never read or write the disk.
-function getDatabaseState(): any {
-  return {};
-}
-
-function saveDatabaseState(_state: any): boolean {
-  return true;
-}
 
 // Campus Isolation Security Guard (NestJS-style authorization guard)
 const enforceCampusAccess = (req: Request, res: Response, targetCampusId: string): boolean => {
@@ -417,7 +364,8 @@ async function enforceRecordCampus(
 
 // Full Database State Retrieval with Role-Based Campus Scoping & Authoritative Supabase Integration
 app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async (req: Request, res: Response) => {
-  let db = getDatabaseState() || {};
+  // Everything below is loaded from Supabase for this request; nothing is cached on the server.
+  const db: any = {};
 
   // If Supabase PostgreSQL is operational on the server, fetch authoritative live data
   if (serverSupabase) {
@@ -1330,29 +1278,9 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
       }
     }
 
-    // 7. Update local JSON ledger cache
-    const db = getDatabaseState() || {};
-
-    // When operating in local mode, enforce duplicate check to avoid duplicates on retries
-    if (!serverSupabase) {
-      const existingLocalUser = (db.users || []).find(
-        (u: any) =>
-          u.email?.toLowerCase() === cleanEmail.toLowerCase() ||
-          u.username?.toLowerCase() === employeeCode.toLowerCase()
-      );
-      const existingLocalTeacher = (db.teachers || []).find(
-        (t: any) => t.employeeCode?.toUpperCase() === employeeCode.toUpperCase()
-      );
-      if (existingLocalUser || existingLocalTeacher) {
-        res.status(400).json({
-          error: `A user account with email "${cleanEmail}" or employee code "${employeeCode}" already exists.`,
-        });
-        return;
-      }
-    }
-
-    const effectiveTeacherId = (serverSupabase && insertedProfile?.id) ? insertedProfile.id : teacherId;
-    const effectiveUserId = (serverSupabase && insertedUser?.id) ? insertedUser.id : userId;
+    // 7. Response records (app shape) built from what was saved
+    const effectiveTeacherId = insertedProfile?.id || teacherId;
+    const effectiveUserId = insertedUser?.id || userId;
 
     const newTeacherRecord = {
       id: effectiveTeacherId,
@@ -1382,21 +1310,9 @@ app.post('/api/teachers/provision', authenticateUser, async (req: Request, res: 
       campusId: targetCampus,
       allowedCampusIds: [targetCampus],
       isActive: true,
-      // Local ledger mode only keeps a password (development); Supabase Auth holds it otherwise.
-      ...(serverSupabase ? {} : { password, token: `jwt-${effectiveUserId}-${Date.now()}` }),
       teacherProfileId: effectiveTeacherId,
       createdAt: new Date().toISOString().substring(0, 10),
     };
-
-    const updatedTeachers = [newTeacherRecord, ...(db.teachers || []).filter((t: any) => t.id !== effectiveTeacherId)];
-    const updatedUsers = [newUserRecord, ...(db.users || []).filter((u: any) => u.id !== effectiveUserId)];
-
-    saveDatabaseState({
-      ...db,
-      teachers: updatedTeachers,
-      users: updatedUsers,
-      updatedAt: new Date().toISOString(),
-    });
 
     res.json({
       success: true,
@@ -1417,7 +1333,6 @@ app.put('/api/teachers/:id', authenticateUser, async (req: Request, res: Respons
     const updates = req.body || {};
 
     const configuredHost = getSafeHost(serverSupabaseUrl);
-    const db = getDatabaseState() || {};
 
     // Validate campus parameter if provided
     if (updates.campusId !== undefined) {
@@ -1700,46 +1615,6 @@ app.put('/api/teachers/:id', authenticateUser, async (req: Request, res: Respons
       // 6. Log safe diagnostics (Never exposing credentials)
       console.log(`[Teacher Update Safe Diagnostics] matchedTeacherProfileId="${currentProfile.id}", linkedUsersId="${linkedUserId}", tablesUpdated="teacher_profiles, users", profileRows=${profileAffectedRows}, userRows=${userAffectedRows}, supabaseErrorCode=none, configuredHost="${configuredHost}"`);
 
-      // 7. Update local JSON cache with verified Supabase state
-      const localTeachers = (db.teachers || []).filter((t: any) => t.id !== verifiedProfile.id && t.userId !== verifiedUser.id);
-      const localUsers = (db.users || []).filter((u: any) => u.id !== verifiedUser.id);
-
-      const cacheTeacher = {
-        id: verifiedProfile.id,
-        userId: verifiedProfile.teacher_id,
-        campusId: verifiedProfile.campus_id,
-        employeeCode: verifiedProfile.employee_code,
-        fullName: `${verifiedUser.first_name || ''} ${verifiedUser.last_name || ''}`.trim() || verifiedProfile.specialization,
-        email: verifiedUser.email,
-        phone: verifiedUser.contact_number || '+44 7700 900000',
-        specialization: verifiedProfile.specialization,
-        qualification: verifiedProfile.qualification,
-        baseMonthlySalary: Number(verifiedProfile.salary),
-        salaryCurrency: verifiedProfile.salary_currency,
-        portalAccessActive: verifiedProfile.status === 'active',
-        isActive: verifiedProfile.status === 'active',
-        assignedClassIds: verifiedProfile.assigned_class_ids || [],
-      };
-
-      const cacheUser = {
-        id: verifiedUser.id,
-        email: verifiedUser.email,
-        username: verifiedUser.username,
-        fullName: `${verifiedUser.first_name || ''} ${verifiedUser.last_name || ''}`.trim(),
-        role: verifiedUser.role,
-        campusId: verifiedUser.active_campus_id,
-        allowedCampusIds: verifiedUser.allowed_campus_ids,
-        isActive: verifiedUser.status === 1,
-        teacherProfileId: verifiedProfile.id,
-      };
-
-      saveDatabaseState({
-        ...db,
-        teachers: [cacheTeacher, ...localTeachers],
-        users: [cacheUser, ...localUsers],
-        updatedAt: new Date().toISOString(),
-      });
-
       res.json({
         success: true,
         message: 'Teacher profile updated successfully.',
@@ -1780,126 +1655,11 @@ app.put('/api/teachers/:id', authenticateUser, async (req: Request, res: Respons
       return;
     }
 
-    // --------------------------------------------------------------------------
-    // B. LOCAL AUTHORITATIVE DATABASE LEDGER FLOW (When Supabase is not active)
-    // --------------------------------------------------------------------------
-    const existing = (db.teachers || []).find(
-      (t: any) =>
-        t.id === id ||
-        t.userId === id ||
-        t.employeeCode === id ||
-        (updates.employeeCode && t.employeeCode?.toUpperCase() === String(updates.employeeCode).trim().toUpperCase()) ||
-        (updates.email && t.email?.toLowerCase() === String(updates.email).trim().toLowerCase())
-    );
-
-    // Zero affected rows cannot produce a success response
-    if (!existing) {
-      console.warn(`[Teacher Update Safe Diagnostics] matchedProfileId=null, linkedUserId=null, tableUpdated=none, affectedRows=0, error="Record not found in local ledger", configuredHost="${configuredHost}"`);
-      res.status(404).json({
-        success: false,
-        error: `Zero rows affected: No teacher record found in database ledger matching identifier "${id}".`,
-        code: 'ZERO_ROWS_AFFECTED',
-        diagnostic: {
-          matchedTeacherProfileId: null,
-          linkedUserId: null,
-          tableUpdated: null,
-          affectedRowCount: 0,
-          supabaseErrorCode: null,
-          configuredSupabaseHost: configuredHost,
-          databaseMode: 'local_database_ledger',
-        },
-      });
-      return;
-    }
-
-    if (!enforceCampusAccess(req, res, existing.campusId)) {
-      return;
-    }
-
-    // Apply updates to local teacher record
-    if (updates.fullName !== undefined) existing.fullName = String(updates.fullName).trim();
-    if (updates.employeeCode !== undefined && String(updates.employeeCode).trim()) {
-      existing.employeeCode = String(updates.employeeCode).trim().toUpperCase();
-    }
-    if (updates.campusId !== undefined) {
-      existing.campusId = String(updates.campusId).trim().toLowerCase();
-    }
-    if (updates.email !== undefined) existing.email = String(updates.email).trim().toLowerCase();
-    if (updates.phone !== undefined) existing.phone = String(updates.phone).trim();
-    if (updates.specialization !== undefined) existing.specialization = String(updates.specialization).trim();
-    if (updates.qualification !== undefined) existing.qualification = String(updates.qualification).trim();
-    if (updates.baseMonthlySalary !== undefined) existing.baseMonthlySalary = Number(updates.baseMonthlySalary);
-    if (updates.salaryCurrency !== undefined) existing.salaryCurrency = String(updates.salaryCurrency).trim();
-    if (updates.portalAccessActive !== undefined) {
-      existing.portalAccessActive = Boolean(updates.portalAccessActive);
-      existing.isActive = Boolean(updates.portalAccessActive);
-    }
-    if (updates.employmentStatus !== undefined) existing.employmentStatus = updates.employmentStatus;
-    if (Array.isArray(updates.assignedClassIds)) existing.assignedClassIds = updates.assignedClassIds;
-
-    // Update linked user
-    let userAffected = 0;
-    const linkedUser = (db.users || []).find((u: any) => u.id === existing.userId || u.teacherProfileId === existing.id);
-    if (linkedUser) {
-      if (updates.fullName) {
-        linkedUser.fullName = String(updates.fullName).trim();
-        const parts = String(updates.fullName).trim().split(' ');
-        linkedUser.firstName = parts[0] || '';
-        linkedUser.lastName = parts.slice(1).join(' ') || '';
-      }
-      if (updates.email) linkedUser.email = String(updates.email).trim().toLowerCase();
-      if (updates.phone) linkedUser.contactNumber = String(updates.phone).trim();
-      if (updates.campusId) {
-        const normCampus = String(updates.campusId).trim().toLowerCase();
-        linkedUser.campusId = normCampus;
-        linkedUser.allowedCampusIds = [normCampus];
-      }
-      if (updates.employeeCode) linkedUser.username = String(updates.employeeCode).trim().toLowerCase();
-      if (updates.portalAccessActive !== undefined) linkedUser.isActive = Boolean(updates.portalAccessActive);
-      userAffected = 1;
-    }
-
-    saveDatabaseState({ ...db, updatedAt: new Date().toISOString() });
-
-    // Directly re-verify persisted state from disk
-    const reReadDb = getDatabaseState() || {};
-    const verifiedTeacher = (reReadDb.teachers || []).find((t: any) => t.id === existing.id);
-    const verifiedUser = (reReadDb.users || []).find((u: any) => u.id === existing.userId);
-
-    if (!verifiedTeacher) {
-      res.status(500).json({
-        success: false,
-        error: 'Persistence verification failed: Updated teacher record could not be confirmed in database.',
-        code: 'PERSISTENCE_VERIFICATION_FAILED',
-      });
-      return;
-    }
-
-    console.log(`[Teacher Update Safe Diagnostics] matchedTeacherProfileId="${existing.id}", linkedUsersId="${existing.userId}", tablesUpdated="teachers, users", profileRows=1, userRows=${userAffected}, supabaseErrorCode=none, configuredHost="${configuredHost}"`);
-
-    res.json({
-      success: true,
-      message: 'Teacher profile updated successfully.',
-      diagnostic: {
-        matchedTeacherProfileId: existing.id,
-        linkedUserId: existing.userId,
-        tableUpdated: 'teachers, users',
-        affectedRowCount: {
-          teachers: 1,
-          users: userAffected,
-          total: 1 + userAffected,
-        },
-        supabaseErrorCode: null,
-        configuredSupabaseHost: configuredHost,
-        databaseMode: 'local_database_ledger',
-        verified: {
-          teacherProfile: {
-            ...verifiedTeacher,
-            salary: verifiedTeacher.baseMonthlySalary,
-          },
-          user: verifiedUser,
-        },
-      },
+    // Only reached if the Supabase flow above did not answer: report that nothing was updated.
+    res.status(404).json({
+      success: false,
+      error: `Zero rows affected: No teacher record found matching identifier "${id}".`,
+      code: 'ZERO_ROWS_AFFECTED',
     });
   } catch (err: any) {
     console.error('[Server] Exception in PUT /api/teachers/:id:', err);
@@ -1912,7 +1672,6 @@ app.delete('/api/teachers/:id', authenticateUser, async (req: Request, res: Resp
   try {
     const { id } = req.params;
     const configuredHost = getSafeHost(serverSupabaseUrl);
-    const db = getDatabaseState() || {};
 
     let profile: any = null;
     let deletedProfileCount = 0;
@@ -2038,63 +1797,10 @@ app.delete('/api/teachers/:id', authenticateUser, async (req: Request, res: Resp
       }
 
       console.log(`[Teacher Delete Safe Diagnostics] matchedTeacherProfileId="${profile.id}", linkedUsersId="${profile.teacher_id}", tablesUpdated="teacher_profiles, users", profileRows=${deletedProfileCount}, userRows=${deletedUserCount}, configuredHost="${configuredHost}"`);
-    } else {
-      // Local ledger deletion
-      const existing = (db.teachers || []).find((t: any) => t.id === id || t.userId === id || t.employeeCode === id);
-      if (!existing) {
-        res.status(404).json({
-          success: false,
-          error: `Zero rows affected: No teacher record found in database ledger matching identifier "${id}".`,
-          code: 'ZERO_ROWS_AFFECTED',
-          diagnostic: {
-            matchedTeacherProfileId: null,
-            linkedUserId: null,
-            tableUpdated: null,
-            affectedRowCount: 0,
-            configuredSupabaseHost: configuredHost,
-          },
-        });
-        return;
-      }
-
-      if (!enforceCampusAccess(req, res, existing.campusId)) {
-        return;
-      }
     }
 
-    // Update local JSON ledger
-    const existingInLocal = (db.teachers || []).find((t: any) => t.id === id || t.userId === id || t.employeeCode === id);
-    const targetUserId = existingInLocal?.userId || (profile && profile.teacher_id) || (id.startsWith('usr-') ? id : undefined);
-    const targetProfileId = profile?.id || existingInLocal?.id || id;
-
-    if (db.teachers) {
-      db.teachers = db.teachers.filter(
-        (t: any) =>
-          t.id !== id &&
-          t.id !== targetProfileId &&
-          t.userId !== id &&
-          (!targetUserId || t.userId !== targetUserId) &&
-          t.employeeCode !== id
-      );
-    }
-    if (db.users && targetUserId) {
-      db.users = db.users.filter(
-        (u: any) =>
-          u.id !== targetUserId &&
-          u.teacherProfileId !== id &&
-          u.teacherProfileId !== targetProfileId
-      );
-    }
-    if (db.classes) {
-      db.classes.forEach((c: any) => {
-        if (c.teacherId === id || c.leadTeacherId === id || (targetUserId && (c.teacherId === targetUserId || c.leadTeacherId === targetUserId))) {
-          c.teacherId = undefined;
-          c.leadTeacherId = undefined;
-          c.leadTeacherName = 'Unassigned';
-        }
-      });
-    }
-    saveDatabaseState(db);
+    const targetUserId = (profile && profile.teacher_id) || (id.startsWith('usr-') ? id : undefined);
+    const targetProfileId = profile?.id || id;
 
     res.json({
       success: true,
@@ -2253,14 +1959,6 @@ app.post('/api/students/provision', authenticateUser, async (req: Request, res: 
       portalAccessActive: true,
     };
 
-    const db = getDatabaseState() || {};
-    const updatedStudents = [newRecord, ...(db.students || []).filter((s: any) => s.id !== studentId)];
-    saveDatabaseState({
-      ...db,
-      students: updatedStudents,
-      updatedAt: new Date().toISOString(),
-    });
-
     res.json({
       success: true,
       message: `Student ${firstName} ${lastName || ''} [${generatedRoll}] enrolled successfully in Supabase.`,
@@ -2277,13 +1975,10 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
     const { id } = req.params;
     const updates = req.body;
 
-    const db = getDatabaseState() || {};
-    const existing = (db.students || []).find((s: any) => s.id === id);
-
     if (!requireAdmin(req, res)) {
       return;
     }
-    if (!(await enforceRecordCampus(req, res, 'students', id, existing?.campusId))) {
+    if (!(await enforceRecordCampus(req, res, 'students', id))) {
       return;
     }
 
@@ -2353,11 +2048,6 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
       }
     }
 
-    if (existing) {
-      Object.assign(existing, updates);
-      saveDatabaseState(db);
-    }
-
     res.json({ success: true, message: 'Student updated successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to update student.' });
@@ -2367,13 +2057,11 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
 app.delete('/api/students/:id', authenticateUser, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const db = getDatabaseState() || {};
-    const existing = (db.students || []).find((s: any) => s.id === id);
 
     if (!requireAdmin(req, res)) {
       return;
     }
-    if (!(await enforceRecordCampus(req, res, 'students', id, existing?.campusId))) {
+    if (!(await enforceRecordCampus(req, res, 'students', id))) {
       return;
     }
 
@@ -2411,11 +2099,6 @@ app.delete('/api/students/:id', authenticateUser, async (req: Request, res: Resp
           archived_by: req.user?.email || 'admin',
         },
       }]);
-    }
-
-    if (db.students) {
-      db.students = db.students.filter((s: any) => s.id !== id);
-      saveDatabaseState(db);
     }
 
     res.json({ success: true, message: 'Student removed successfully.' });
@@ -2506,9 +2189,6 @@ app.post('/api/classes', authenticateUser, async (req: Request, res: Response) =
       isActive: true,
     };
 
-    const db = getDatabaseState() || {};
-    db.classes = [newClassRoom, ...(db.classes || []).filter((c: any) => c.id !== classId)];
-    saveDatabaseState(db);
 
     res.json({
       success: true,
@@ -2525,13 +2205,10 @@ app.put('/api/classes/:id', authenticateUser, async (req: Request, res: Response
     const { id } = req.params;
     const updates = req.body;
 
-    const db = getDatabaseState() || {};
-    const existing = (db.classes || []).find((c: any) => c.id === id);
-
     if (!requireAdmin(req, res)) {
       return;
     }
-    if (!(await enforceRecordCampus(req, res, 'classes', id, existing?.campusId))) {
+    if (!(await enforceRecordCampus(req, res, 'classes', id))) {
       return;
     }
 
@@ -2580,11 +2257,6 @@ app.put('/api/classes/:id', authenticateUser, async (req: Request, res: Response
       }
     }
 
-    if (existing) {
-      Object.assign(existing, updates);
-      saveDatabaseState(db);
-    }
-
     res.json({ success: true, message: 'Class updated successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to update class.' });
@@ -2594,13 +2266,11 @@ app.put('/api/classes/:id', authenticateUser, async (req: Request, res: Response
 app.delete('/api/classes/:id', authenticateUser, async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const db = getDatabaseState() || {};
-    const existing = (db.classes || []).find((c: any) => c.id === id);
 
     if (!requireAdmin(req, res)) {
       return;
     }
-    if (!(await enforceRecordCampus(req, res, 'classes', id, existing?.campusId))) {
+    if (!(await enforceRecordCampus(req, res, 'classes', id))) {
       return;
     }
 
@@ -2613,10 +2283,6 @@ app.delete('/api/classes/:id', authenticateUser, async (req: Request, res: Respo
       }
     }
 
-    if (db.classes) {
-      db.classes = db.classes.filter((c: any) => c.id !== id);
-      saveDatabaseState(db);
-    }
 
     res.json({ success: true, message: 'Class removed successfully.' });
   } catch (err: any) {
@@ -2735,17 +2401,6 @@ app.post('/api/attendance/teacher', authenticateUser, async (req: Request, res: 
     }
   }
 
-  const db = getDatabaseState() || {};
-  const currentTchAttendance = db.teacherAttendance || [];
-  const existingIdx = currentTchAttendance.findIndex((a: any) => a.teacherId === teacherId && a.date === date);
-  if (existingIdx >= 0) {
-    currentTchAttendance[existingIdx] = { ...currentTchAttendance[existingIdx], ...attendanceRecord };
-  } else {
-    currentTchAttendance.push(attendanceRecord);
-  }
-  db.teacherAttendance = currentTchAttendance;
-  saveDatabaseState(db);
-
   res.json({
     success: true,
     record: attendanceRecord,
@@ -2791,33 +2446,6 @@ app.post('/api/attendance/student/bulk', authenticateUser, async (req: Request, 
     }
   }
 
-  const db = getDatabaseState() || {};
-  const currentAttendance = db.studentAttendance || [];
-
-  records.forEach((rec: any) => {
-    const existingIdx = currentAttendance.findIndex((a: any) => a.studentId === rec.studentId && a.date === date);
-    const newEntry = {
-      id: rec.id || `att-std-${rec.studentId}-${date}`,
-      campusId,
-      classId,
-      studentId: rec.studentId,
-      studentName: rec.studentName || 'Student',
-      date,
-      status: rec.status,
-      remarks: rec.remarks || '',
-      recordedBy: req.user?.fullName || 'Teacher',
-      updatedAt: new Date().toISOString(),
-    };
-    if (existingIdx >= 0) {
-      currentAttendance[existingIdx] = { ...currentAttendance[existingIdx], ...newEntry };
-    } else {
-      currentAttendance.push(newEntry);
-    }
-  });
-
-  db.studentAttendance = currentAttendance;
-  saveDatabaseState(db);
-
   res.json({
     success: true,
     savedCount: records.length,
@@ -2858,13 +2486,6 @@ app.put('/api/campuses/:id', authenticateUser, async (req: Request, res: Respons
         res.status(500).json({ error: `Supabase campus update failed: ${campErr.message}` });
         return;
       }
-    }
-
-    const db = getDatabaseState() || {};
-    const existing = (db.campuses || []).find((c: any) => c.id === id);
-    if (existing) {
-      Object.assign(existing, updates);
-      saveDatabaseState(db);
     }
 
     res.json({ success: true, message: 'Campus configuration updated successfully.' });
@@ -2967,13 +2588,6 @@ app.post('/api/users', authenticateUser, async (req: Request, res: Response) => 
       contactNumber,
       createdAt: new Date().toISOString().substring(0, 10),
     };
-    // Local ledger mode only: keep the password for development logins.
-    if (!serverSupabase) newUser.password = password || 'Misbah2026!';
-
-    const db = getDatabaseState() || {};
-    db.users = [newUser, ...(db.users || []).filter((u: any) => u.id !== userId)];
-    saveDatabaseState(db);
-
     res.json({ success: true, user: newUser });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to create user.' });
@@ -3051,14 +2665,6 @@ app.put('/api/users/:id', authenticateUser, async (req: Request, res: Response) 
       }
     }
 
-    const db = getDatabaseState() || {};
-    const existing = (db.users || []).find((u: any) => u.id === id);
-    if (existing) {
-      const { password: _pw, ...safeUpdates } = updates;
-      Object.assign(existing, serverSupabase ? safeUpdates : updates);
-      saveDatabaseState(db);
-    }
-
     res.json({ success: true, message: 'User updated successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to update user.' });
@@ -3114,10 +2720,6 @@ app.delete('/api/users/:id', authenticateUser, async (req: Request, res: Respons
       await authSvc.deleteAuthAccount(serverSupabase, row?.auth_user_id);
     }
 
-    const db = getDatabaseState() || {};
-    db.users = (db.users || []).filter((u: any) => u.id !== id);
-    saveDatabaseState(db);
-
     res.json({ success: true, message: 'User deleted successfully.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to delete user.' });
@@ -3171,10 +2773,6 @@ app.post('/api/payments', authenticateUser, async (req: Request, res: Response) 
       paymentMethod: paymentMethod || 'Cash',
     };
 
-    const db = getDatabaseState() || {};
-    db.payments = [newPayment, ...(db.payments || [])];
-    saveDatabaseState(db);
-
     res.json({ success: true, payment: newPayment });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to create payment invoice.' });
@@ -3185,13 +2783,11 @@ app.put('/api/payments/:id/status', authenticateUser, async (req: Request, res: 
   try {
     const { id } = req.params;
     const { status, paymentMethod, amountPaid, paidDate } = req.body;
-    const db = getDatabaseState() || {};
-    const existing = (db.payments || []).find((p: any) => p.id === id);
 
     if (!requireAdmin(req, res)) {
       return;
     }
-    if (!(await enforceRecordCampus(req, res, 'payment_invoices', id, existing?.campusId))) {
+    if (!(await enforceRecordCampus(req, res, 'payment_invoices', id))) {
       return;
     }
 
@@ -3216,15 +2812,6 @@ app.put('/api/payments/:id/status', authenticateUser, async (req: Request, res: 
         res.status(500).json({ error: `Supabase invoice update failed: ${updErr.message}` });
         return;
       }
-    }
-
-    if (existing) {
-      existing.status = status;
-      if (paymentMethod) existing.paymentMethod = paymentMethod;
-      if (amountPaid !== undefined) existing.amountPaid = Number(amountPaid);
-      if (paidDate) existing.paidDate = paidDate;
-      else if (status === 'PAID') existing.paidDate = new Date().toISOString().substring(0, 10);
-      saveDatabaseState(db);
     }
 
     res.json({ success: true, message: 'Invoice status updated successfully.' });
@@ -3335,11 +2922,6 @@ app.post('/api/incidents', authenticateUser, async (req: Request, res: Response)
       attachedFiles: Array.isArray(attachedFiles) ? attachedFiles : undefined,
     };
 
-    const db = getDatabaseState() || {};
-    if (!db.incidents) db.incidents = [];
-    db.incidents.unshift(incidentEntry);
-    saveDatabaseState(db);
-
     // Supabase incident_logs persistence
     if (serverSupabase) {
       try {
@@ -3379,15 +2961,6 @@ app.put('/api/incidents/:id/status', authenticateUser, async (req: Request, res:
     if (!['APPROVED', 'REJECTED', 'SUBMITTED', 'ACTIVE'].includes(String(status).toUpperCase())) {
       res.status(400).json({ error: 'Valid status required (APPROVED, REJECTED).' });
       return;
-    }
-
-    const db = getDatabaseState() || {};
-    const existing = (db.incidents || []).find((i: any) => i.id === id);
-    if (existing) {
-      existing.status = status;
-      existing.reviewedBy = user.fullName || user.email || 'Admin';
-      existing.reviewNotes = reviewNotes || existing.reviewNotes;
-      saveDatabaseState(db);
     }
 
     if (serverSupabase) {
@@ -3455,17 +3028,6 @@ app.post('/api/medicals', authenticateUser, async (req: Request, res: Response) 
       reportedBy: user.fullName || user.email || 'Staff',
       createdAt: nowIso.split('T')[0],
     };
-
-    const db = getDatabaseState() || {};
-    if (!db.medicalRecords) db.medicalRecords = [];
-    db.medicalRecords.unshift(medicalEntry);
-
-    // Update student's medicalNotes in db.students as well
-    const student = (db.students || []).find((s: any) => s.id === studentId);
-    if (student) {
-      student.medicalNotes = `Condition: ${condition}; Allergies: ${allergies || 'None'}; Emergency: ${emergencyContact || ''}`;
-    }
-    saveDatabaseState(db);
 
     // Supabase persistence: medical_records + the student's summary notes.
     try {

@@ -609,7 +609,6 @@ At the current size (largest table ≈ 110 rows) Postgres will choose sequential
 ## Known technical debt
 
 - **Pending teacher approvals** have no data source: nothing in the app creates them, so the list is always empty.
-- `server.ts` still contains inert `getDatabaseState()` / `saveDatabaseState()` calls and `if (!serverSupabase)` branches from the retired local ledger. They read and write nothing; remove them when those endpoints are next changed.
 - `users.allowed_campus_ids` and `teacher_profiles.assigned_class_ids` are legacy duplicates of `user_campus_access` and `classes.teacher_id`; remove once no code reads them.
 - `classes.title` duplicates `name`.
 - `users.status` is an integer (1 = active, 0 = inactive).
