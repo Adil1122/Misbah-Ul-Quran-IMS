@@ -363,7 +363,7 @@ export const DocumentManagerComponent: React.FC<DocumentManagerComponentProps> =
 
                 <div className="flex items-center space-x-2 self-end sm:self-center shrink-0">
                   {/* View action */}
-                  {isImageOrPdf && (
+                  {isImageOrPdf && doc.fileAvailable !== false && (
                     <button
                       type="button"
                       onClick={() => handleView(doc)}
@@ -376,15 +376,24 @@ export const DocumentManagerComponent: React.FC<DocumentManagerComponentProps> =
                   )}
 
                   {/* Download action */}
-                  <button
-                    type="button"
-                    onClick={() => handleDownload(doc)}
-                    title="Download file bytes"
-                    className="px-2.5 py-1.5 rounded-lg border border-[#E6E2D8] bg-white hover:bg-[#F4F3EE] text-[#0D381E] font-bold text-xs flex items-center space-x-1 cursor-pointer transition-colors shadow-2xs"
-                  >
-                    <Download className="w-3.5 h-3.5 text-[#0D381E]" />
-                    <span>Download</span>
-                  </button>
+                  {doc.fileAvailable === false ? (
+                    <span
+                      title="Imported from the old system; the file itself was not transferred."
+                      className="px-2.5 py-1.5 rounded-lg border border-dashed border-[#E6E2D8] text-[#8A948C] text-xs font-medium"
+                    >
+                      File not available
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleDownload(doc)}
+                      title="Download file bytes"
+                      className="px-2.5 py-1.5 rounded-lg border border-[#E6E2D8] bg-white hover:bg-[#F4F3EE] text-[#0D381E] font-bold text-xs flex items-center space-x-1 cursor-pointer transition-colors shadow-2xs"
+                    >
+                      <Download className="w-3.5 h-3.5 text-[#0D381E]" />
+                      <span>Download</span>
+                    </button>
+                  )}
 
                   {/* Delete action */}
                   {canDelete && (

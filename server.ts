@@ -3238,51 +3238,30 @@ app.put('/api/payments/:id/status', authenticateUser, async (req: Request, res: 
 // ==============================================================================
 app.post('/api/audit-logs', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const user = req.user;
-    const { campus_id, campusId, action, details, entityType, entityId } = req.body;
-    const targetCampus = campus_id || campusId || user?.activeCampusId || 'uk';
-    const logAction = action || 'GENERAL_ACTION';
-    const auditDetails = typeof details === 'object' && details !== null ? details : {
-      message: details || 'System event',
-      entityType: entityType || 'System',
-      entityId: entityId || '',
-      performedBy: user?.fullName || user?.email || 'User',
-      timestamp: new Date().toISOString(),
-    };
+    const user = req.user!;
+    const { campus_id, campusId, action, details, entityType, entityId } = req.body || {};
+    // audit_logs columns: id, campus_id, user_id, action, details (jsonb), ip_address, created_at.
+    // Entity and reason live inside details.
+    const requested = String(campus_id || campusId || user.activeCampusId || '').trim();
+    const allowed = user.role === 'SUPER_ADMIN' || user.allowedCampusIds.includes('all') || user.allowedCampusIds.includes(requested);
+    const targetCampus = allowed ? requested : user.activeCampusId;
+    const payloadDetails: Record<string, unknown> = typeof details === 'object' && details !== null ? { ...details } : { message: details || 'System event' };
+    if (entityType) payloadDetails.entity_type = String(entityType).slice(0, 100);
+    if (entityId) payloadDetails.entity_id = String(entityId).slice(0, 200);
+    payloadDetails.performed_by = user.fullName || user.email;
 
-    if (serverSupabase) {
-      try {
-        await serverSupabase.from('audit_logs').insert([{
-          campus_id: targetCampus === 'all' ? null : targetCampus,
-          user_id: user?.id && user.id.startsWith('usr-') ? user.id : null,
-          action: logAction,
-          entity_type: entityType || 'System',
-          entity_id: entityId || (user?.id || 'sys'),
-          reason: typeof details === 'string' ? details : (auditDetails?.reason || auditDetails?.message || 'System Event'),
-          details: auditDetails,
-        }]);
-      } catch (sbErr) {
-        console.warn('[Server Supabase] Audit log insert non-fatal warning:', sbErr);
-      }
+    if (!serverSupabase) return res.status(503).json({ error: 'Database not configured.' });
+    const { error } = await serverSupabase.from('audit_logs').insert([{
+      campus_id: !targetCampus || targetCampus === 'all' ? null : targetCampus,
+      user_id: user.id,
+      action: String(action || 'GENERAL_ACTION').slice(0, 100),
+      details: payloadDetails,
+      ip_address: String(req.ip || '').slice(0, 50) || null,
+    }]);
+    if (error) {
+      console.warn('[Server Supabase] Audit log insert failed:', error.message);
+      return res.status(500).json({ error: `Audit entry not saved: ${error.message}` });
     }
-
-    const db = getDatabaseState() || {};
-    if (!db.auditLogs) db.auditLogs = [];
-    db.auditLogs.unshift({
-      id: `log-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      campusId: targetCampus,
-      userId: user?.id || 'admin',
-      userName: user?.fullName || 'User',
-      userRole: user?.role || 'CAMPUS_ADMIN',
-      action: logAction,
-      entityType: entityType || 'System',
-      entityId: entityId || '',
-      details: typeof details === 'string' ? details : JSON.stringify(auditDetails),
-      timestamp: new Date().toISOString(),
-    });
-    if (db.auditLogs.length > 500) db.auditLogs = db.auditLogs.slice(0, 500);
-    saveDatabaseState(db);
-
     res.json({ success: true, message: 'Audit entry recorded securely.' });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to record audit log entry.' });

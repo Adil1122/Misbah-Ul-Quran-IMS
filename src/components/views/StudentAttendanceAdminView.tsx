@@ -57,10 +57,14 @@ export const StudentAttendanceAdminView: React.FC<StudentAttendanceAdminViewProp
 
   // Campus context - Campus Admin is strictly locked to their own campus
   const effectiveCampus = isSuperAdmin ? activeCampusId : user.activeCampusId;
-  const campuses = IMSStateService.getCampuses();
-  const classes = IMSStateService.getClasses(effectiveCampus);
-  const students = IMSStateService.getStudents(effectiveCampus);
-  const teachers = IMSStateService.getTeachers(effectiveCampus);
+  // Re-read shared state only when it changes. The getters return new arrays on every call,
+  // so reading them directly in render made the roll-call effect below loop forever.
+  const [dataVersion, setDataVersion] = useState(0);
+  useEffect(() => IMSStateService.subscribe(() => setDataVersion((v) => v + 1)), []);
+  const campuses = useMemo(() => IMSStateService.getCampuses(), [dataVersion]);
+  const classes = useMemo(() => IMSStateService.getClasses(effectiveCampus), [effectiveCampus, dataVersion]);
+  const students = useMemo(() => IMSStateService.getStudents(effectiveCampus), [effectiveCampus, dataVersion]);
+  const teachers = useMemo(() => IMSStateService.getTeachers(effectiveCampus), [effectiveCampus, dataVersion]);
 
   // Active View Mode: 'roll-call' (Class attendance) vs 'ledger' (Full detailed table) vs 'daily-overview'
   const [viewMode, setViewMode] = useState<'roll-call' | 'ledger' | 'daily-overview'>('roll-call');
@@ -159,8 +163,9 @@ export const StudentAttendanceAdminView: React.FC<StudentAttendanceAdminViewProp
   };
 
   // Get all attendance records for campus (or all campuses for Super Admin)
-  const allAttendance = IMSStateService.getStudentAttendance(
-    campusFilter === 'all' ? undefined : campusFilter
+  const allAttendance = useMemo(
+    () => IMSStateService.getStudentAttendance(campusFilter === 'all' ? undefined : campusFilter),
+    [campusFilter, dataVersion]
   );
 
   // Filter attendance records

@@ -758,26 +758,37 @@ CREATE POLICY "misbah_documents_delete_policy" ON storage.objects
 
                     <td className="py-3 px-4 text-right">
                       <div className="flex items-center justify-end space-x-1.5">
-                        {/* Preview */}
-                        <button
-                          onClick={() => setPreviewDoc(doc)}
-                          className="p-1.5 rounded-lg border border-[#E6E2D8] hover:bg-[#F4F3EE] text-[#0D381E] cursor-pointer"
-                          title="Preview Document"
-                        >
-                          <Eye className="w-3.5 h-3.5" />
-                        </button>
+                        {doc.fileAvailable === false ? (
+                          <span
+                            title="Imported from the old system; the file itself was not transferred."
+                            className="px-2 py-1 rounded-lg border border-dashed border-[#E6E2D8] text-[#8A948C] text-[11px] font-medium"
+                          >
+                            File not available
+                          </span>
+                        ) : (
+                          <>
+                            {/* Preview */}
+                            <button
+                              onClick={() => setPreviewDoc(doc)}
+                              className="p-1.5 rounded-lg border border-[#E6E2D8] hover:bg-[#F4F3EE] text-[#0D381E] cursor-pointer"
+                              title="Preview Document"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                            </button>
 
-                        {/* Direct Download */}
-                        <a
-                          href={doc.url || `/api/documents/${doc.id}/download`}
-                          target="_blank"
-                          rel="noreferrer"
-                          download={doc.name}
-                          className="p-1.5 rounded-lg border border-[#E6E2D8] hover:bg-[#F4F3EE] text-[#0D381E] cursor-pointer"
-                          title="Download from Bucket"
-                        >
-                          <Download className="w-3.5 h-3.5" />
-                        </a>
+                            {/* Direct Download */}
+                            <a
+                              href={doc.url || `/api/documents/${doc.id}/download`}
+                              target="_blank"
+                              rel="noreferrer"
+                              download={doc.name}
+                              className="p-1.5 rounded-lg border border-[#E6E2D8] hover:bg-[#F4F3EE] text-[#0D381E] cursor-pointer"
+                              title="Download from Bucket"
+                            >
+                              <Download className="w-3.5 h-3.5" />
+                            </a>
+                          </>
+                        )}
 
                         {/* Copy Link */}
                         <button

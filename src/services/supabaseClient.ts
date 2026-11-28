@@ -555,28 +555,20 @@ export class SupabaseDbService {
     reason?: string;
     details?: any;
   }): Promise<DbResult> {
+    // Audit entries are written only by the server (/api/audit-logs), which records the
+    // signed-in user from the verified token. The browser never writes audit_logs directly.
     try {
-      // 1. Authoritative Backend Proxy (Bypasses client anon RLS restriction safely on server)
       let userToken = '';
-      try {
-        if (typeof window !== 'undefined') {
-          const stored = localStorage.getItem('misbah_current_user');
-          if (stored) {
-            const u = JSON.parse(stored);
-            if (u?.token) userToken = u.token;
-          }
-        }
-      } catch {}
-
+      if (supabase) {
+        const { data } = await supabase.auth.getSession();
+        userToken = data.session?.access_token || '';
+      }
+      if (!userToken) return { success: false, error: 'Not signed in' };
       const res = await fetch('/api/audit-logs', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${userToken}`,
-        },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${userToken}` },
         body: JSON.stringify({
           campusId: event.campus_id,
-          userId: event.user_id,
           action: event.action || 'GENERAL_AUDIT',
           entityType: event.entity_type,
           entityId: event.entity_id,
@@ -585,48 +577,12 @@ export class SupabaseDbService {
             details: event.details,
             old_values: event.old_values,
             new_values: event.new_values,
-            timestamp: new Date().toISOString(),
           },
         }),
       });
-
-      if (res.ok) {
-        return { success: true };
-      }
-    } catch {
-      // Non-blocking fallback
-    }
-
-    if (!supabase) return { success: false, notConfigured: true, error: 'Supabase not configured' };
-    try {
-      const payload: any = {
-        action: event.action || 'GENERAL_AUDIT',
-        entity_type: event.entity_type || 'SYSTEM',
-        entity_id: event.entity_id || '0',
-        reason: event.reason || (typeof event.details === 'string' ? event.details : 'System activity'),
-        details: {
-          entity_type: event.entity_type,
-          entity_id: event.entity_id,
-          reason: event.reason,
-          old_values: event.old_values,
-          new_values: event.new_values,
-          ...(typeof event.details === 'object' ? event.details : { message: event.details }),
-        },
-      };
-
-      if (event.campus_id && (event.campus_id === 'uk' || event.campus_id === 'kts')) {
-        payload.campus_id = event.campus_id;
-      }
-
-      if (event.user_id && typeof event.user_id === 'string' && event.user_id.startsWith('usr-')) {
-        payload.user_id = event.user_id;
-      }
-
-      const { data, error } = await supabase.from('audit_logs').insert([payload]);
-      if (error) {
-        return { success: false, error: error.message };
-      }
-      return { success: true, data };
+      if (res.ok) return { success: true };
+      const body = await res.json().catch(() => ({}));
+      return { success: false, error: body?.error || `HTTP ${res.status}` };
     } catch (err: any) {
       return { success: false, error: err?.message || 'Network error logging audit' };
     }

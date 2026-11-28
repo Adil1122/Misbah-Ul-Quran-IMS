@@ -33,6 +33,8 @@ export interface DocumentAttachment {
   campusId?: string;
   entityType?: string;
   entityId?: string;
+  /** false for records imported from the old system whose file was never moved to Storage. */
+  fileAvailable?: boolean;
 }
 
 export interface TeachingMaterial {

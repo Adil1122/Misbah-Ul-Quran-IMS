@@ -100,9 +100,12 @@ export const TeacherAttendanceAdminView: React.FC<TeacherAttendanceAdminViewProp
     return campusObj?.timezone || (effectiveCampus === 'uk' ? 'Europe/London' : 'Asia/Karachi');
   }, [campusObj, effectiveCampus]);
 
+  // Refresh the teacher list when shared state changes (e.g. a teacher added in another view).
+  const [dataVersion, setDataVersion] = useState(0);
+  useEffect(() => IMSStateService.subscribe(() => setDataVersion((v) => v + 1)), []);
   const teachers = useMemo(() => {
     return IMSStateService.getTeachers(campusFilter === 'all' ? undefined : campusFilter);
-  }, [campusFilter]);
+  }, [campusFilter, dataVersion]);
 
   // Live campus clock
   const [liveClock, setLiveClock] = useState(() => getCampusCurrentTime(timezone));

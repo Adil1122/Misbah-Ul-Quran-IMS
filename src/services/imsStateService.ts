@@ -312,13 +312,27 @@ export class IMSStateService {
     this.listeners.forEach((l) => l());
   }
 
+  private static loadingServerState: Promise<boolean> | null = null;
+  private static refreshTimer: ReturnType<typeof setTimeout> | null = null;
+
   /**
-   * Live synchronization with Persistent Server Database and Supabase PostgreSQL on startup
+   * Loads everything the signed-in user may see from the server (/api/database/state).
+   * The server is the single source of truth: it applies role and campus scoping and maps
+   * database rows to app records. Concurrent calls share one request.
    */
-  static async initSupabaseSync(): Promise<void> {
+  static loadServerState(): Promise<boolean> {
+    if (!this.loadingServerState) {
+      this.loadingServerState = this.fetchServerState().finally(() => {
+        this.loadingServerState = null;
+      });
+    }
+    return this.loadingServerState;
+  }
+
+  private static async fetchServerState(): Promise<boolean> {
+    const token = this.getValidAccessToken();
+    if (!token) return false;
     try {
-      const token = this.getValidAccessToken();
-      // 1. Initial State Hydration from Server Database File (only when authenticated)
       if (token) {
         const serverRes = await fetch('/api/database/state', {
           headers: {
@@ -363,718 +377,58 @@ export class IMSStateService {
             }
             this.persistAll();
             this.notify();
+            return true;
           }
         } else if (serverRes.status === 401) {
           console.warn('[IMSStateService] State hydration rejected: session token is missing or expired.');
         }
       }
     } catch {
-      // server sync fallback handled
+      // network error: keep the data already shown
     }
+    return false;
+  }
 
-    try {
-      const dbCampuses = await SupabaseDbService.fetchCampuses();
-      if (dbCampuses && dbCampuses.length > 0) {
-        this.campuses = dbCampuses.map((c: any) => ({
-          id: c.id,
-          code: c.code,
-          name: c.name,
-          country: c.country,
-          city: c.city,
-          address: c.address,
-          timezone: c.timezone,
-          currencyCode: c.currency_code,
-          phone: c.phone,
-          email: c.email,
-          isActive: c.is_active !== false,
-          bankDetails: c.bank_details || undefined,
-        }));
-      }
-
-      const dbUsers = await SupabaseDbService.fetchUsers();
-      if (dbUsers && dbUsers.length > 0) {
-        dbUsers.forEach((u: any) => {
-          const existingIdx = this.users.findIndex((x) => x.id === u.id || x.email === u.email);
-          const formattedUser = {
-            id: u.id,
-            email: u.email,
-            username: u.username || u.email?.split('@')[0] || u.id,
-            fullName: `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email,
-            role: u.role,
-            campusId: u.active_campus_id,
-            isActive: u.status === 1 || u.status === true,
-            studentId: u.student_id,
-            teacherProfileId: u.teacher_profile_id,
-            parentProfileId: u.parent_profile_id,
-            allowedCampusIds: Array.isArray(u.allowed_campus_ids) ? u.allowed_campus_ids : ['all', 'uk', 'kts'],
-            createdAt: u.created_at ? new Date(u.created_at).toISOString().split('T')[0] : '2026-01-10',
-            lastLogin: '2026-10-15 08:30',
-          };
-          if (existingIdx >= 0) {
-            this.users[existingIdx] = { ...this.users[existingIdx], ...formattedUser };
-          } else {
-            this.users.push(formattedUser);
-          }
-        });
-      }
-
-      // 1. Fetch Teachers First from Supabase
-      const dbTeachers = await SupabaseDbService.fetchTeachers();
-      if (dbTeachers && dbTeachers.length > 0) {
-        dbTeachers.forEach((t: any) => {
-          const u = t.users || {};
-          const fullName = `${u.first_name || ''} ${u.last_name || ''}`.trim() || t.specialization || `Teacher ${t.employee_code || t.id}`;
-          const existingIdx = this.teachers.findIndex((x) => x.id === t.id);
-          const teacherObj: TeacherProfile = {
-            id: t.id,
-            userId: t.teacher_id,
-            campusId: t.campus_id || 'uk',
-            employeeCode: t.employee_code || `TCH-${t.id}`,
-            fullName,
-            email: u.email || `teacher${t.id}@misbah.org`,
-            phone: u.contact_number || '+44 7700 900000',
-            specialization: t.specialization || 'Quran & Tajweed',
-            qualification: t.qualification || 'Sanad in Hafs an Asim',
-            joinDate: t.joining_date || '2026-01-20',
-            employmentStatus: 'FULL_TIME',
-            assignedClassIds: Array.isArray(t.assigned_class_ids) ? [...t.assigned_class_ids] : [],
-            assignedClassNames: [],
-            baseMonthlySalary: Number(t.salary || 0),
-            salaryCurrency: t.salary_currency || (t.campus_id === 'uk' ? 'GBP' : 'PKR'),
-            paymentMethod: 'CASH',
-            portalAccessActive: t.status !== 'suspended' && t.status !== 0 && t.status !== false,
-            isActive: t.status !== 'suspended' && t.status !== 'archived' && t.status !== 0 && t.status !== false,
-          };
-          if (existingIdx >= 0) {
-            this.teachers[existingIdx] = { ...this.teachers[existingIdx], ...teacherObj };
-          } else {
-            this.teachers.push(teacherObj);
-          }
-        });
-      }
-
-      // 2. Fetch Classes and bind teacher relationships using authoritative classes.teacher_id -> users.id
-      const dbClasses = await SupabaseDbService.fetchClasses();
-      if (dbClasses && dbClasses.length > 0) {
-        dbClasses.forEach((c: any) => {
-          const existingIdx = this.classes.findIndex((x) => x.id === c.id);
-          const className = c.title || c.name || `Class ${c.id}`;
-
-          // Match teacher by classes.teacher_id (foreign key referencing users.id)
-          const matchedTeacher = c.teacher_id
-            ? this.teachers.find((t) => t.userId === c.teacher_id || t.id === c.teacher_id)
-            : undefined;
-
-          // If matched, ensure this class is in the teacher's assignedClassIds
-          if (matchedTeacher) {
-            if (!matchedTeacher.assignedClassIds.includes(c.id)) {
-              matchedTeacher.assignedClassIds.push(c.id);
-            }
-            if (!matchedTeacher.assignedClassNames) {
-              matchedTeacher.assignedClassNames = [];
-            }
-            if (!matchedTeacher.assignedClassNames.includes(className)) {
-              matchedTeacher.assignedClassNames.push(className);
-            }
-          }
-
-          const classObj: ClassRoom = {
-            id: c.id,
-            campusId: c.campus_id || 'uk',
-            name: className,
-            code: c.code || `${c.campus_id?.toUpperCase() || 'CLS'}-${c.id}`,
-            gradeLevel: c.grade_level || c.description || (className.includes('Boys') ? 'Boys Section' : className.includes('Girls') ? 'Girls Section' : 'General Section'),
-            section: c.section || (className.includes('Boys') ? 'Boys' : className.includes('Girls') ? 'Girls' : 'General'),
-            academicYear: c.academic_year || '2025-2026',
-            capacity: Number(c.capacity || 25),
-            maxCapacity: Number(c.capacity || 25),
-            leadTeacherId: c.teacher_id || undefined,
-            leadTeacherName: matchedTeacher?.fullName || undefined,
-            studentCount: Number(c.student_count || 0),
-            scheduleDays: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
-            scheduleTime: c.schedule_time || '5:00 PM - 7:30 PM (Mon-Fri)',
-            room: c.room || 'Main Hall',
-            isActive: c.is_active !== false,
-          };
-
-          if (existingIdx >= 0) {
-            this.classes[existingIdx] = { ...this.classes[existingIdx], ...classObj };
-          } else {
-            this.classes.push(classObj);
-          }
-        });
-      }
-
-      // 3. Fetch Students and bind class relationships using authoritative students.class_id -> classes.id
-      const dbStudents = await SupabaseDbService.fetchStudents();
-      if (dbStudents && dbStudents.length > 0) {
-        dbStudents.forEach((s: any) => {
-          const existingIdx = this.students.findIndex((x) => x.id === s.id);
-          const matchedClass = s.class_id ? this.classes.find((c) => c.id === s.class_id) : undefined;
-
-          let parsedParentContact: { name?: string; phone?: string } | null = null;
-          try {
-            if (s.primary_contact_details) {
-              parsedParentContact = typeof s.primary_contact_details === 'string'
-                ? JSON.parse(s.primary_contact_details)
-                : s.primary_contact_details;
-            }
-          } catch {
-            // ignore
-          }
-
-          const studentObj: StudentRecord = {
-            id: s.id,
-            admissionNumber: s.roll_number || `MUQ-${(s.campus_id || 'UK').toUpperCase()}-${s.id}`,
-            campusId: s.campus_id || 'uk',
-            firstName: s.first_name || 'Student',
-            lastName: s.last_name || '',
-            gender: (s.gender || 'female').toUpperCase() === 'MALE' ? 'MALE' : 'FEMALE',
-            dob: s.date_of_birth || '2016-06-15',
-            enrollmentDate: s.admission_date || '2026-01-01',
-            currentGrade: matchedClass?.gradeLevel || matchedClass?.name || 'General Halaqah',
-            classId: s.class_id || '',
-            className: matchedClass?.name || 'Unassigned',
-            section: matchedClass?.section || 'Section A',
-            primaryParentName: parsedParentContact?.name || 'Parent / Guardian',
-            primaryParentPhone: parsedParentContact?.phone || '',
-            address: s.address || '',
-            bloodGroup: s.blood_group || 'B+',
-            medicalNotes: s.medical_notes || '',
-            quranMilestone: s.quran_milestone || 'Juz 1',
-            monthlyFee: Number(s.monthly_fee_amount || 0),
-            admissionFee: Number(s.admission_fee_amount || 0),
-            isActive: s.status === 'active' || s.status === 1 || s.status === true,
-            approvalStatus: s.approval_status || 'APPROVED',
-            attendanceRate: 100,
-            feeStatus: 'UP_TO_DATE',
-            portalAccessActive: true,
-            parentIds: s.parent_id ? [s.parent_id] : [],
-          };
-
-          if (existingIdx >= 0) {
-            this.students[existingIdx] = { ...this.students[existingIdx], ...studentObj };
-          } else {
-            this.students.push(studentObj);
-          }
-        });
-      }
-
-      const dbPayments = await SupabaseDbService.fetchPaymentInvoices();
-      if (dbPayments && dbPayments.length > 0) {
-        dbPayments.forEach((p: any) => {
-          const existingIdx = this.payments.findIndex((x) => x.id === p.id);
-          const payObj: any = {
-            id: p.id,
-            campusId: p.campus_id || 'kts',
-            studentId: p.reference_id,
-            studentName: `Student ${p.reference_id}`,
-            admissionNumber: `REG-${Number(p.reference_id) + 999}`,
-            invoiceNumber: `INV-KTS-${String(p.id).padStart(4, '0')}`,
-            title: 'Monthly Tuition Fee',
-            amountDue: Number(p.amount || 0),
-            amountPaid: p.payment_status === 'paid' ? Number(p.amount || 0) : 0,
-            currency: p.currency || 'PKR',
-            status: p.payment_status === 'paid' ? 'PAID' : 'PENDING',
-            dueDate: p.due_date,
-            paidDate: p.payment_date || undefined,
-            paymentMethod: p.payment_method || 'Cash',
-          };
-          if (existingIdx >= 0) {
-            this.payments[existingIdx] = { ...this.payments[existingIdx], ...payObj };
-          } else {
-            this.payments.push(payObj);
-          }
-        });
-      }
-
-      // 4. Fetch Teacher Attendance from Supabase
-      try {
-        const dbTeacherAtt = await SupabaseDbService.fetchTeacherAttendance();
-        if (dbTeacherAtt && dbTeacherAtt.length > 0) {
-          dbTeacherAtt.forEach((a: any) => {
-            // Supabase stores the user id (usr-...); the portal keys attendance by profile id (tch-...).
-            const teacher = this.teachers.find((t) => t.id === a.teacher_id || t.userId === a.teacher_id);
-            const portalTeacherId = teacher?.id || a.teacher_id;
-            const existingIdx = this.teacherAttendance.findIndex(
-              (x) => (x.teacherId === portalTeacherId || x.teacherId === a.teacher_id) && x.date === a.date
-            );
-            const entry: TeacherAttendanceRecord = {
-              id: a.id || `att-tch-${a.teacher_id}-${a.date}`,
-              campusId: a.campus_id || 'uk',
-              teacherId: portalTeacherId,
-              teacherName: teacher?.fullName || 'Faculty Member',
-              teacherCode: teacher?.employeeCode || `TCH-${a.teacher_id}`,
-              date: a.date,
-              status: a.status as TeacherAttendanceStatus,
-              checkInTime: a.check_in_time,
-              ruleApplied: (a.rule_applied || 'UP_TO_5PM') as any,
-              isSystemGenerated: a.is_system_generated || false,
-              remarks: a.remarks || '',
-              recordedBy: a.recorded_by || 'Admin',
-              updatedAt: a.updated_at || a.created_at || new Date().toISOString(),
-            };
-            if (existingIdx >= 0) {
-              this.teacherAttendance[existingIdx] = { ...this.teacherAttendance[existingIdx], ...entry };
-            } else {
-              this.teacherAttendance.unshift(entry);
-            }
-          });
-        }
-      } catch (attErr) {
-        console.warn('[Supabase Sync] Teacher attendance fetch notice:', attErr);
-      }
-
-      // 5. Fetch Student Attendance from Supabase
-      try {
-        const dbStudentAtt = await SupabaseDbService.fetchStudentAttendance();
-        if (dbStudentAtt && dbStudentAtt.length > 0) {
-          const studentMap = new Map(this.students.map((s) => [s.id, s]));
-          dbStudentAtt.forEach((a: any) => {
-            const existingIdx = this.studentAttendance.findIndex(
-              (x) => x.studentId === a.student_id && x.date === a.date && x.classId === a.class_id
-            );
-            const std = studentMap.get(a.student_id);
-            const entry: StudentAttendanceRecord = {
-              id: a.id || `att-std-${a.student_id}-${a.date}`,
-              campusId: a.campus_id || 'uk',
-              classId: a.class_id,
-              className: std?.className || 'Class',
-              studentId: a.student_id,
-              studentName: std ? `${std.firstName} ${std.lastName}` : 'Student',
-              admissionNumber: std?.admissionNumber || '',
-              date: a.date,
-              status: a.status as StudentAttendanceStatus,
-              arrivalTime: a.arrival_time,
-              remarks: a.remarks || '',
-              recordedBy: a.recorded_by || 'Staff',
-              updatedAt: a.updated_at || a.created_at || new Date().toISOString(),
-            };
-            if (existingIdx >= 0) {
-              this.studentAttendance[existingIdx] = { ...this.studentAttendance[existingIdx], ...entry };
-            } else {
-              this.studentAttendance.unshift(entry);
-            }
-          });
-        }
-      } catch (sattErr) {
-        console.warn('[Supabase Sync] Student attendance fetch notice:', sattErr);
-      }
-
-      // 6. Fetch Incident Logs & Medical Records from Supabase
-      try {
-        const dbIncidents = await SupabaseDbService.fetchIncidentLogs();
-        if (dbIncidents && dbIncidents.length > 0) {
-          const studentMap = new Map(this.students.map((s) => [s.id, s]));
-          dbIncidents.forEach((log: any) => {
-            const isMedical = log.title?.startsWith('[MEDICAL]');
-            const std = log.student_id ? studentMap.get(log.student_id) : undefined;
-            const studentName = std ? `${std.firstName} ${std.lastName}` : 'Student';
-
-            if (isMedical) {
-              let parsed: any = {};
-              try {
-                if (log.description && log.description.startsWith('{')) {
-                  parsed = JSON.parse(log.description);
-                }
-              } catch {}
-
-              const existingIdx = this.medicalRecords.findIndex((m) => m.id === log.id);
-              const medRecord: MedicalRecord = {
-                id: log.id,
-                campusId: log.campus_id || 'uk',
-                studentId: log.student_id || '',
-                studentName,
-                condition: parsed.condition || log.title.replace('[MEDICAL] Condition:', '').trim() || 'Medical Note',
-                severity: parsed.severity || 'HIGH',
-                allergies: parsed.allergies || '',
-                medicationNotes: parsed.medicationNotes || '',
-                emergencyContact: parsed.emergencyContact || (log.action_taken?.replace('Emergency Contact:', '').trim()) || std?.primaryParentPhone || '',
-                status: (log.status || 'SUBMITTED') as any,
-                reportedBy: parsed.reportedBy || 'Staff',
-                createdAt: log.created_at ? log.created_at.split('T')[0] : (log.date || '2026-10-29'),
-              };
-              if (existingIdx >= 0) {
-                this.medicalRecords[existingIdx] = { ...this.medicalRecords[existingIdx], ...medRecord };
-              } else {
-                this.medicalRecords.unshift(medRecord);
-              }
-            } else {
-              let parsedFiles: any = undefined;
-              if (log.attachments) {
-                try {
-                  if (log.attachments.startsWith('[') || log.attachments.startsWith('{')) {
-                    parsedFiles = JSON.parse(log.attachments);
-                  } else {
-                    parsedFiles = [{ id: `att-${log.id}`, name: log.attachments, sizeMb: 1.0, type: 'PDF' }];
-                  }
-                } catch {
-                  parsedFiles = [{ id: `att-${log.id}`, name: log.attachments, sizeMb: 1.0, type: 'PDF' }];
-                }
-              }
-
-              let incType: any = 'BEHAVIORAL';
-              if (log.title?.includes('[ACADEMIC]')) incType = 'ACADEMIC';
-              else if (log.title?.includes('[INJURY]')) incType = 'INJURY';
-              else if (log.title?.includes('[MEDICAL]')) incType = 'MEDICAL';
-
-              const existingIdx = this.incidents.findIndex((i) => i.id === log.id);
-              const incRecord: IncidentReportRecord = {
-                id: log.id,
-                campusId: log.campus_id || 'uk',
-                studentId: log.student_id || '',
-                studentName,
-                reporterId: 'staff',
-                reporterName: 'Staff Member',
-                type: incType,
-                severity: 'MEDIUM',
-                description: log.description || log.title || '',
-                actionTaken: log.action_taken || '',
-                status: (log.status || 'SUBMITTED') as any,
-                createdAt: log.created_at ? log.created_at.replace('T', ' ').substring(0, 19) : (log.date || '2026-10-29'),
-                attachedFiles: parsedFiles,
-              };
-              if (existingIdx >= 0) {
-                this.incidents[existingIdx] = { ...this.incidents[existingIdx], ...incRecord };
-              } else {
-                this.incidents.unshift(incRecord);
-              }
-            }
-          });
-        }
-      } catch (incErr) {
-        console.warn('[Supabase Sync] Incident logs fetch notice:', incErr);
-      }
-
-      this.persistAll();
-      this.notify();
-
-      // 4. Initialize Bi-Directional Real-Time Synchronization with Supabase PostgreSQL
-      if (isSupabaseConfigured && !this.realtimeSubscribed) {
-        this.realtimeSubscribed = true;
-        this.realtimeUnsubscribe = SupabaseDbService.subscribeToRealtimeChanges((payload) => {
-          this.handleSupabaseRealtimeChange(payload);
-        });
-
-        // Periodic reconciliation polling (every 15 seconds) to ensure zero stale state
-        if (!this.pollIntervalId && typeof window !== 'undefined') {
-          this.pollIntervalId = window.setInterval(() => {
-            this.reconcileSupabaseState().catch(() => {});
-          }, 15000);
-          window.addEventListener('focus', () => {
-            this.reconcileSupabaseState().catch(() => {});
-          });
-        }
-      }
-    } catch (err) {
-      console.warn('[IMSStateService] Supabase sync notice:', err);
-    }
+  /** Reload shortly after a burst of change events, once. */
+  private static scheduleServerRefresh(): void {
+    if (this.refreshTimer) clearTimeout(this.refreshTimer);
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.loadServerState().catch(() => {});
+    }, 500);
   }
 
   /**
-   * Real-time processor for incoming Supabase PostgreSQL replication events
+   * Initial load after sign-in, then keeps data fresh: Supabase change events (when the
+   * project publishes them) and a periodic reload while the tab is visible. Nothing runs
+   * while signed out.
    */
-  private static handleSupabaseRealtimeChange(payload: {
-    table: string;
-    eventType: string;
-    newRecord: any;
-    oldRecord: any;
-  }): void {
-    const { table, eventType, newRecord, oldRecord } = payload;
-    console.log(`[Supabase Realtime] Event on ${table} (${eventType}) received in IMS`);
+  static async initSupabaseSync(): Promise<void> {
+    const loaded = await this.loadServerState();
+    if (!loaded || typeof window === 'undefined') return;
 
-    if (table === 'students') {
-      if (eventType === 'DELETE' && oldRecord?.id) {
-        this.students = this.students.filter((s) => s.id !== oldRecord.id);
-      } else if (newRecord?.id) {
-        const idx = this.students.findIndex((s) => s.id === newRecord.id || s.admissionNumber === newRecord.roll_number);
-        const mappedStudent: Partial<StudentRecord> = {
-          id: newRecord.id,
-          admissionNumber: newRecord.roll_number || newRecord.id,
-          campusId: newRecord.campus_id || 'uk',
-          firstName: newRecord.first_name || '',
-          lastName: newRecord.last_name || '',
-          gender: (newRecord.gender || 'FEMALE').toUpperCase() as any,
-          dob: newRecord.date_of_birth || '2016-01-01',
-          classId: newRecord.class_id || '',
-          isActive: newRecord.status !== 'inactive',
-          monthlyFee: Number(newRecord.monthly_fee_amount || 0),
-          admissionFee: Number(newRecord.admission_fee_amount || 0),
-          address: newRecord.address || '',
-        };
-        if (idx >= 0) {
-          this.students[idx] = { ...this.students[idx], ...mappedStudent };
-        } else {
-          this.students.unshift({
-            ...mappedStudent,
-            enrollmentDate: newRecord.admission_date || new Date().toISOString().substring(0, 10),
-            currentGrade: 'G1',
-            className: 'General Halaqah',
-            section: 'Section A',
-            bloodGroup: 'B+',
-            medicalNotes: '',
-            approvalStatus: newRecord.approval_status || 'APPROVED',
-            parentIds: [],
-            primaryParentName: 'Parent / Guardian',
-            primaryParentPhone: '',
-            attendanceRate: 100,
-            feeStatus: 'UP_TO_DATE',
-            portalAccessActive: true,
-            quranMilestone: 'Juz 1',
-          } as StudentRecord);
-        }
-      }
-      this.persist('students', this.students);
-      this.notify();
-    } else if (table === 'teacher_profiles') {
-      if (eventType === 'DELETE' && oldRecord?.id) {
-        this.teachers = this.teachers.filter((t) => t.id !== oldRecord.id && t.userId !== oldRecord.teacher_id);
-      } else if (newRecord?.id) {
-        const idx = this.teachers.findIndex((t) => t.id === newRecord.id || t.userId === newRecord.teacher_id);
-        const mappedTeacher: Partial<TeacherProfile> = {
-          id: newRecord.id,
-          userId: newRecord.teacher_id,
-          campusId: newRecord.campus_id || 'uk',
-          employeeCode: newRecord.employee_code || `TCH-${newRecord.id}`,
-          specialization: newRecord.specialization || 'Quran & Tajweed',
-          qualification: newRecord.qualification || 'Sanad in Hafs an Asim',
-          baseMonthlySalary: Number(newRecord.salary || 0),
-          salaryCurrency: newRecord.salary_currency || 'PKR',
-          assignedClassIds: Array.isArray(newRecord.assigned_class_ids) ? newRecord.assigned_class_ids : [],
-          portalAccessActive: newRecord.status !== 'suspended',
-          isActive: newRecord.status !== 'suspended',
-        };
-        if (idx >= 0) {
-          this.teachers[idx] = { ...this.teachers[idx], ...mappedTeacher };
-        } else {
-          this.teachers.unshift({
-            ...mappedTeacher,
-            fullName: `Teacher ${newRecord.employee_code || newRecord.id}`,
-            email: `teacher${newRecord.id}@misbah.org`,
-            phone: '+44 7700 900000',
-            joinDate: newRecord.joining_date || new Date().toISOString().substring(0, 10),
-            employmentStatus: 'FULL_TIME',
-            assignedClassNames: [],
-            paymentMethod: 'CASH',
-          } as TeacherProfile);
-        }
-      }
-      this.persist('teachers', this.teachers);
-      this.notify();
-    } else if (table === 'classes') {
-      if (eventType === 'DELETE' && oldRecord?.id) {
-        this.classes = this.classes.filter((c) => c.id !== oldRecord.id);
-      } else if (newRecord?.id) {
-        const idx = this.classes.findIndex((c) => c.id === newRecord.id);
-        const mappedClass: Partial<ClassRoom> = {
-          id: newRecord.id,
-          campusId: newRecord.campus_id || 'uk',
-          name: newRecord.title || newRecord.name || 'Halaqah',
-          code: newRecord.code || newRecord.id,
-          capacity: Number(newRecord.capacity || 25),
-          maxCapacity: Number(newRecord.capacity || 25),
-          leadTeacherId: newRecord.teacher_id || undefined,
-          isActive: newRecord.is_active !== false,
-        };
-        if (idx >= 0) {
-          this.classes[idx] = { ...this.classes[idx], ...mappedClass };
-        } else {
-          this.classes.push({
-            ...mappedClass,
-            gradeLevel: 'General Halaqah',
-            academicYear: newRecord.academic_year || '2025-2026',
-            studentCount: 0,
-            currentEnrollment: 0,
-            scheduleDays: ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'],
-            scheduleTime: '5:00 PM - 7:30 PM (Mon-Fri)',
-            room: 'Main Hall',
-          } as ClassRoom);
-        }
-      }
-      this.persist('classes', this.classes);
-      this.notify();
-    } else if (table === 'users') {
-      if (eventType === 'DELETE' && oldRecord?.id) {
-        this.users = this.users.filter((u) => u.id !== oldRecord.id);
-      } else if (newRecord?.id) {
-        const idx = this.users.findIndex((u) => u.id === newRecord.id || u.email === newRecord.email);
-        const mappedUser: Partial<UserAccount> = {
-          id: newRecord.id,
-          email: newRecord.email,
-          username: newRecord.username || newRecord.email?.split('@')[0],
-          fullName: `${newRecord.first_name || ''} ${newRecord.last_name || ''}`.trim() || newRecord.email,
-          role: newRecord.role,
-          campusId: newRecord.active_campus_id,
-          isActive: newRecord.status === 1 || newRecord.status === true,
-        };
-        if (idx >= 0) {
-          this.users[idx] = { ...this.users[idx], ...mappedUser };
-        }
-      }
-      this.persist('users', this.users);
-      this.notify();
-    } else if (table === 'payment_invoices') {
-      if (eventType === 'DELETE' && oldRecord?.id) {
-        this.payments = this.payments.filter((p) => p.id !== String(oldRecord.id));
-      } else if (newRecord?.id) {
-        const idx = this.payments.findIndex((p) => p.id === String(newRecord.id));
-        const mappedPay: Partial<PaymentRecord> = {
-          id: String(newRecord.id),
-          amountDue: Number(newRecord.amount || 0),
-          amountPaid: newRecord.payment_status === 'paid' ? Number(newRecord.amount || 0) : 0,
-          currency: newRecord.currency || 'PKR',
-          status: newRecord.payment_status === 'paid' ? 'PAID' : 'PENDING',
-          dueDate: newRecord.due_date,
-          paidDate: newRecord.payment_date || undefined,
-          paymentMethod: newRecord.payment_method || 'Cash',
-        };
-        if (idx >= 0) {
-          this.payments[idx] = { ...this.payments[idx], ...mappedPay };
-        }
-      }
-      this.persist('payments', this.payments);
-      this.notify();
+    if (isSupabaseConfigured && !this.realtimeSubscribed) {
+      this.realtimeSubscribed = true;
+      this.realtimeUnsubscribe = SupabaseDbService.subscribeToRealtimeChanges(() => this.scheduleServerRefresh());
+    }
+    if (!this.pollIntervalId) {
+      this.pollIntervalId = window.setInterval(() => {
+        if (!document.hidden && this.currentUser) this.loadServerState().catch(() => {});
+      }, 30000);
+      window.addEventListener('focus', () => {
+        if (this.currentUser) this.loadServerState().catch(() => {});
+      });
     }
   }
 
-  /**
-   * Periodic reconciliation reconciling any external edits in Supabase into IMS
-   */
+  /** Re-reads all data from the server (kept for callers of the old reconcile API). */
   static async reconcileSupabaseState(): Promise<void> {
-    if (!isSupabaseConfigured) return;
-    try {
-      const [students, teachers, classes, payments] = await Promise.all([
-        SupabaseDbService.fetchStudents().catch(() => null),
-        SupabaseDbService.fetchTeachers().catch(() => null),
-        SupabaseDbService.fetchClasses().catch(() => null),
-        SupabaseDbService.fetchPaymentInvoices().catch(() => null),
-      ]);
-
-      if (students && students.length > 0) {
-        students.forEach((s: any) => {
-          const idx = this.students.findIndex((x) => x.id === s.id || x.admissionNumber === s.roll_number);
-          if (idx >= 0) {
-            this.students[idx] = {
-              ...this.students[idx],
-              firstName: s.first_name || this.students[idx].firstName,
-              lastName: s.last_name || this.students[idx].lastName,
-              campusId: s.campus_id || this.students[idx].campusId,
-              classId: s.class_id || this.students[idx].classId,
-              isActive: s.status !== 'inactive',
-              monthlyFee: Number(s.monthly_fee_amount || this.students[idx].monthlyFee),
-              admissionFee: Number(s.admission_fee_amount || this.students[idx].admissionFee),
-            };
-          }
-        });
-        this.persist('students', this.students);
-      }
-
-      if (teachers && teachers.length > 0) {
-        teachers.forEach((t: any) => {
-          const u = t.users || {};
-          const fullName = `${u.first_name || ''} ${u.last_name || ''}`.trim() || t.specialization;
-          const idx = this.teachers.findIndex((x) => x.id === t.id || x.userId === t.teacher_id);
-          if (idx >= 0) {
-            this.teachers[idx] = {
-              ...this.teachers[idx],
-              fullName: fullName || this.teachers[idx].fullName,
-              email: u.email || this.teachers[idx].email,
-              phone: u.contact_number || this.teachers[idx].phone,
-              specialization: t.specialization || this.teachers[idx].specialization,
-              qualification: t.qualification || this.teachers[idx].qualification,
-              baseMonthlySalary: Number(t.salary || this.teachers[idx].baseMonthlySalary),
-              salaryCurrency: t.salary_currency || this.teachers[idx].salaryCurrency,
-              assignedClassIds: Array.isArray(t.assigned_class_ids) ? t.assigned_class_ids : this.teachers[idx].assignedClassIds,
-              portalAccessActive: t.status !== 'suspended' && t.status !== 0,
-              isActive: t.status !== 'suspended' && t.status !== 'archived',
-            };
-          }
-        });
-        this.persist('teachers', this.teachers);
-      }
-
-      if (classes && classes.length > 0) {
-        classes.forEach((c: any) => {
-          const idx = this.classes.findIndex((x) => x.id === c.id);
-          if (idx >= 0) {
-            this.classes[idx] = {
-              ...this.classes[idx],
-              name: c.title || c.name || this.classes[idx].name,
-              code: c.code || this.classes[idx].code,
-              capacity: Number(c.capacity || this.classes[idx].capacity),
-              leadTeacherId: c.teacher_id || this.classes[idx].leadTeacherId,
-              isActive: c.is_active !== false,
-            };
-          }
-        });
-        this.persist('classes', this.classes);
-      }
-
-      if (payments && payments.length > 0) {
-        payments.forEach((p: any) => {
-          const idx = this.payments.findIndex((x) => x.id === String(p.id));
-          if (idx >= 0) {
-            this.payments[idx] = {
-              ...this.payments[idx],
-              amountDue: Number(p.amount || this.payments[idx].amountDue),
-              amountPaid: p.payment_status === 'paid' ? Number(p.amount || 0) : this.payments[idx].amountPaid,
-              status: p.payment_status === 'paid' ? 'PAID' : 'PENDING',
-              paymentMethod: p.payment_method || this.payments[idx].paymentMethod,
-            };
-          }
-        });
-        this.persist('payments', this.payments);
-      }
-
-      this.notify();
-    } catch (err) {
-      console.warn('[IMSStateService] Reconcile error:', err);
-    }
+    await this.loadServerState();
   }
 
-  /**
-   * Refreshes registered faculty instructors on demand
-   */
+  /** Re-reads data from the server and returns the current teacher list. */
   static async refreshTeachers(): Promise<TeacherProfile[]> {
-    try {
-      const dbTeachers = await SupabaseDbService.fetchTeachers();
-      if (dbTeachers && dbTeachers.length > 0) {
-        dbTeachers.forEach((t: any) => {
-          const u = t.users || {};
-          const fullName = `${u.first_name || ''} ${u.last_name || ''}`.trim() || t.specialization || `Teacher ${t.employee_code || t.id}`;
-          const existingIdx = this.teachers.findIndex((x) => x.id === t.id || x.userId === t.teacher_id);
-          const teacherObj: TeacherProfile = {
-            id: t.id,
-            userId: t.teacher_id,
-            campusId: t.campus_id || 'uk',
-            employeeCode: t.employee_code || `TCH-${t.id}`,
-            fullName,
-            email: u.email || `teacher${t.id}@misbah.org`,
-            phone: u.contact_number || '+44 7700 900000',
-            specialization: t.specialization || 'Quran & Tajweed',
-            qualification: t.qualification || 'Sanad in Hafs an Asim',
-            joinDate: t.joining_date || '2026-01-20',
-            employmentStatus: 'FULL_TIME',
-            assignedClassIds: Array.isArray(t.assigned_class_ids) ? [...t.assigned_class_ids] : [],
-            assignedClassNames: [],
-            baseMonthlySalary: Number(t.salary || 0),
-            salaryCurrency: t.salary_currency || (t.campus_id === 'uk' ? 'GBP' : 'PKR'),
-            paymentMethod: 'CASH',
-            portalAccessActive: t.status !== 'suspended' && t.status !== 0 && t.status !== false,
-            isActive: t.status !== 'suspended' && t.status !== 'archived' && t.status !== 0 && t.status !== false,
-          };
-          if (existingIdx >= 0) {
-            this.teachers[existingIdx] = { ...this.teachers[existingIdx], ...teacherObj };
-          } else {
-            this.teachers.push(teacherObj);
-          }
-        });
-        this.persist('teachers', this.teachers);
-        this.notify();
-      }
-    } catch (err) {
-      console.warn('[IMSStateService] refreshTeachers notice:', err);
-    }
+    await this.loadServerState();
     return this.teachers;
   }
 
@@ -1412,8 +766,9 @@ export class IMSStateService {
   }
 
   static logout(): void {
+    let audited: Promise<void> = Promise.resolve();
     if (this.currentUser) {
-      this.addAuditLog({
+      audited = this.addAuditLog({
         userId: this.currentUser.id,
         userName: this.currentUser.fullName,
         userRole: this.currentUser.role,
@@ -1432,9 +787,11 @@ export class IMSStateService {
       // ignore
     }
     if (supabase) {
-      supabase.auth.signOut().catch(() => {
+      // Sign out only after the logout entry is recorded: signing out revokes the token it uses.
+      const client = supabase;
+      audited.finally(() => client.auth.signOut().catch(() => {
         // ignore network errors on sign-out
-      });
+      }));
     }
     this.currentUser = null;
     this.branchImpersonation = { isImpersonating: false, campusId: null };
@@ -3763,7 +3120,7 @@ export class IMSStateService {
     return true;
   }
 
-  static addAuditLog(entry: Omit<AuditLogRecord, 'id' | 'timestamp'>): void {
+  static addAuditLog(entry: Omit<AuditLogRecord, 'id' | 'timestamp'>): Promise<void> {
     const log: AuditLogRecord = {
       ...entry,
       id: `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -3771,15 +3128,17 @@ export class IMSStateService {
     };
     this.auditLogs.unshift(log);
 
-    // Background Supabase persistence
-    SupabaseDbService.logAuditEvent({
+    // Background persistence through the server.
+    return SupabaseDbService.logAuditEvent({
       campus_id: entry.campusId,
       user_id: entry.userId,
       action: entry.action,
       entity_type: entry.entityType,
       entity_id: entry.entityId,
       reason: entry.details,
-    }).catch((err) => console.warn('[Supabase Sync] Audit log error:', err));
+    })
+      .then((r) => { if (!r.success) console.warn('[Audit] Entry not saved:', r.error); })
+      .catch((err) => console.warn('[Audit] Entry not saved:', err));
   }
 
   // --- Automated Teacher Attendance Rules ---
