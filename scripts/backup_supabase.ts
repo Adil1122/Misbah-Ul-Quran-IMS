@@ -40,7 +40,10 @@ async function main() {
   const outDir = path.resolve(process.cwd(), 'backups', stamp);
   fs.mkdirSync(outDir, { recursive: true });
 
-  const manifest: { createdAt: string; host: string; tables: Record<string, number>; authUsers?: number; errors: string[] } = {
+  const manifest: {
+    createdAt: string; host: string; tables: Record<string, number>; authUsers?: number;
+    storageFiles?: Record<string, number>; errors: string[];
+  } = {
     createdAt: new Date().toISOString(),
     host: new URL(url).host,
     tables: {},
@@ -77,6 +80,40 @@ async function main() {
   fs.writeFileSync(path.join(outDir, '_auth_users.json'), JSON.stringify(authUsers, null, 2), 'utf-8');
   manifest.authUsers = authUsers.length;
   console.log(`${'auth.users'.padEnd(24)} ${authUsers.length}`);
+
+  // Uploaded files (private storage buckets) — saved under _storage/<bucket>/<path>.
+  const { data: buckets, error: bucketErr } = await supabase.storage.listBuckets();
+  if (bucketErr) manifest.errors.push(`storage buckets: ${bucketErr.message}`);
+  manifest.storageFiles = {};
+  for (const bucket of buckets || []) {
+    let count = 0;
+    const walk = async (prefix: string): Promise<void> => {
+      const { data: entries, error } = await supabase.storage.from(bucket.id).list(prefix, { limit: 1000 });
+      if (error) {
+        manifest.errors.push(`storage ${bucket.id}/${prefix}: ${error.message}`);
+        return;
+      }
+      for (const entry of entries || []) {
+        const objectPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (!entry.id) {
+          await walk(objectPath); // folder
+          continue;
+        }
+        const { data: blob, error: dlErr } = await supabase.storage.from(bucket.id).download(objectPath);
+        if (dlErr || !blob) {
+          manifest.errors.push(`storage ${bucket.id}/${objectPath}: ${dlErr?.message || 'download failed'}`);
+          continue;
+        }
+        const target = path.join(outDir, '_storage', bucket.id, ...objectPath.split('/'));
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, Buffer.from(await blob.arrayBuffer()));
+        count++;
+      }
+    };
+    await walk('');
+    manifest.storageFiles[bucket.id] = count;
+    console.log(`${('storage:' + bucket.id).padEnd(24)} ${count} file(s)`);
+  }
 
   fs.writeFileSync(path.join(outDir, '_manifest.json'), JSON.stringify(manifest, null, 2), 'utf-8');
   console.log(`\nBackup written to ${outDir}`);

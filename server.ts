@@ -6,6 +6,7 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import * as authSvc from './server/authService.ts';
+import * as records from './server/records.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -160,6 +161,15 @@ app.use((_req: Request, _res: Response, next: NextFunction) => {
 
 // Body Parser Middleware
 app.use(express.json({ limit: '10mb' }));
+
+// Supabase is the only data store. Without it, every data route is unavailable.
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  if (serverSupabase || req.path === '/health') return next();
+  res.status(503).json({
+    error: 'Database unavailable: Supabase is not configured or not reachable. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.',
+    code: 'DATABASE_UNAVAILABLE',
+  });
+});
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // CORS & Security Headers
@@ -324,65 +334,35 @@ app.get('/api/health', (req: Request, res: Response) => {
 
 // Diagnostic Endpoint (Safe - never exposes secrets)
 app.get(['/api/database/diagnostics', '/api/diagnostics'], (req: Request, res: Response) => {
-  const db = getDatabaseState();
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
     configuredSupabaseHost: getSafeHost(serverSupabaseUrl),
     supabaseActive: Boolean(serverSupabase),
     serviceRoleConfigured: Boolean(serverSupabaseKey),
-    operatingMode: serverSupabase ? 'authoritative_supabase' : 'local_database_ledger',
+    operatingMode: serverSupabase ? 'supabase' : 'unavailable',
     campuses: ['uk', 'kts'],
-    recordCounts: {
-      teachers: db?.teachers?.length || 0,
-      users: db?.users?.length || 0,
-      students: db?.students?.length || 0,
-      classes: db?.classes?.length || 0,
-    },
   });
 });
 
 // ==============================================================================
 // 2.1 PERSISTENT DATABASE ENGINE (Local JSON Ledger + Supabase Cloud Bridge)
 // ==============================================================================
-const DB_FILE = path.resolve(__dirname, 'data', 'ims_database.json');
-
-function getDatabaseState() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      const content = fs.readFileSync(DB_FILE, 'utf-8');
-      return JSON.parse(content);
-    }
-  } catch (err) {
-    console.error('[Database Engine] Failed to read database:', err);
-  }
-  return null;
-}
-
-// Collections whose source of truth is Supabase. When Supabase is configured they are
-// never written to the local JSON file (it only keeps features that have no table yet).
+// Collections whose source of truth is Supabase (all of them). Used by the state loader.
 const SUPABASE_BACKED_KEYS = [
   'campuses', 'users', 'teachers', 'classes', 'students', 'payments',
   'teacherAttendance', 'studentAttendance', 'incidents', 'medicalRecords', 'auditLogs',
 ];
 
-function saveDatabaseState(state: any): boolean {
-  if (serverSupabase && state && typeof state === 'object') {
-    state = { ...state };
-    for (const key of SUPABASE_BACKED_KEYS) delete state[key];
-  }
-  try {
-    const dir = path.dirname(DB_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(DB_FILE, JSON.stringify(state, null, 2), 'utf-8');
-    return true;
-  } catch (err: any) {
-    // In serverless / read-only filesystems (e.g. Vercel), local disk writes are non-fatal because Supabase PostgreSQL is the authoritative store
-    console.warn('[Database Engine] Local disk write skipped or unsupported (serverless / read-only filesystem):', err?.message || err);
-    return true;
-  }
+// The local JSON ledger (data/ims_database.json) has been retired: Supabase is the only
+// data store. These inert shims keep older call sites harmless while they are cleaned up;
+// they never read or write the disk.
+function getDatabaseState(): any {
+  return {};
+}
+
+function saveDatabaseState(_state: any): boolean {
+  return true;
 }
 
 // Campus Isolation Security Guard (NestJS-style authorization guard)
@@ -608,7 +588,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
             approvalStatus: s.approval_status || 'APPROVED',
             attendanceRate: 100,
             feeStatus: 'UP_TO_DATE',
-            portalAccessActive: true,
+            portalAccessActive: s.portal_access_active !== false,
             parentIds: s.parent_id ? [s.parent_id] : [],
           };
         });
@@ -762,6 +742,56 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
           details: d.reason || d.message || JSON.stringify(d),
         };
       });
+
+      // Remaining collections (expenses, exams, progress, announcements, events,
+      // notifications, teaching materials, salaries, medical records).
+      const legacyMedicals = db.medicalRecords || [];
+      const lookups = await records.loadLookups(serverSupabase);
+      const collections = await records.loadAllCollections(serverSupabase, lookups);
+      Object.assign(db, collections);
+      // Medical notes recorded before migration 05 were stored as [MEDICAL] incidents.
+      db.medicalRecords = [...collections.medicalRecords, ...legacyMedicals];
+
+      // Parents: profile + linked user account + children (students.parent_id).
+      const { data: parentRows, error: parentErr } = await serverSupabase.from('parent_profiles').select('*');
+      if (parentErr) throw parentErr;
+      db.parents = (parentRows || []).map((p: any) => {
+        const u: any = userMap.get(p.user_id) || {};
+        return {
+          id: p.id,
+          userId: p.user_id,
+          campusId: p.campus_id,
+          fullName: `${u.first_name || ''} ${u.last_name || ''}`.trim() || u.email || p.user_id,
+          email: u.email || '',
+          phone: p.phone || u.contact_number || '',
+          cnicOrId: p.cnic_or_id || '',
+          occupation: p.occupation || '',
+          address: p.address || '',
+          linkedStudentIds: (studentsRes.data || []).filter((st: any) => st.parent_id === p.user_id).map((st: any) => st.id),
+          portalAccessActive: u.status === 1,
+        };
+      });
+
+      // Pending admissions are students awaiting approval (there is no separate table).
+      const campusNames = new Map((db.campuses || []).map((c: any) => [c.id, c.name]));
+      db.pendingAdmissions = (db.students || [])
+        .filter((st: any) => String(st.approvalStatus).toUpperCase() === 'PENDING_APPROVAL')
+        .map((st: any) => ({
+          id: st.id,
+          studentId: st.id,
+          studentName: `${st.firstName} ${st.lastName}`.trim(),
+          temporaryReference: st.admissionNumber,
+          campusId: st.campusId,
+          campusName: campusNames.get(st.campusId) || st.campusId,
+          gradeApplying: st.currentGrade || '',
+          dateOfBirth: st.dob,
+          submissionDate: st.enrollmentDate,
+          submittedByAdminName: 'Campus Administration',
+          parentName: st.primaryParentName,
+          parentPhone: st.primaryParentPhone,
+          status: 'PENDING_APPROVAL',
+        }));
+      db.pendingTeachers = [];
     } catch (err: any) {
       console.error('[Server Supabase] Error fetching live state from Supabase:', err?.message || err);
       res.status(502).json({ error: 'Could not load data from the database. Please try again.' });
@@ -795,7 +825,13 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
         payments: (db.payments || []).filter((p: any) => childIds.has(p.studentId)),
         studentAttendance: (db.studentAttendance || []).filter((a: any) => childIds.has(a.studentId)),
         examResults: (db.examResults || []).filter((e: any) => childIds.has(e.studentId)),
-        teachers: [], parents: [], users: [], auditLogs: [], incidents: [], teacherAttendance: [],
+        academicProgress: (db.academicProgress || []).filter((p: any) => childIds.has(p.studentId)),
+        announcements: (db.announcements || []).filter((a: any) => !a.campusId || (user.allowedCampusIds || []).includes(a.campusId)),
+        events: (db.events || []).filter((e: any) => (user.allowedCampusIds || []).includes(e.campusId)),
+        parents: (db.parents || []).filter((p: any) => p.userId === user.id),
+        teachers: [], users: [], auditLogs: [], incidents: [], teacherAttendance: [],
+        expenses: [], salaryRecords: [], notifications: [], teachingMaterials: [], medicalRecords: [],
+        pendingAdmissions: [], pendingTeachers: [],
       },
       scopedCampus: user.allowedCampusIds,
       authoritativeSource: serverSupabase ? 'supabase' : 'local_cache',
@@ -819,7 +855,7 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
     parents: filterByCampus(db.parents),
     classes: filterByCampus(db.classes),
     payments: isCampusAdmin ? filterByCampus(db.payments) : [],
-    expenses: filterByCampus(db.expenses),
+    expenses: isCampusAdmin ? filterByCampus(db.expenses) : [],
     teacherAttendance: isCampusAdmin
       ? filterByCampus(db.teacherAttendance)
       : (db.teacherAttendance || []).filter((a: any) => a.teacherId === (user as any).teacherProfileId || a.teacherId === user.id),
@@ -828,7 +864,13 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
     incidents: filterByCampus(db.incidents),
     announcements: filterByCampus(db.announcements),
     auditLogs: isCampusAdmin ? filterByCampus(db.auditLogs).filter((l: any) => l.campusId) : [],
-    salaryRecords: filterByCampus(db.salaryRecords),
+    salaryRecords: isCampusAdmin
+      ? filterByCampus(db.salaryRecords)
+      : (db.salaryRecords || []).filter((r: any) => r.teacherId === user.teacherProfileId),
+    events: filterByCampus(db.events),
+    notifications: filterByCampus(db.notifications),
+    teachingMaterials: filterByCampus(db.teachingMaterials),
+    medicalRecords: filterByCampus(db.medicalRecords),
     examResults: filterByCampus(db.examResults),
     pendingAdmissions: filterByCampus(db.pendingAdmissions),
     pendingTeachers: filterByCampus(db.pendingTeachers),
@@ -844,74 +886,36 @@ app.get(['/api/database/state', '/api/state', '/state'], authenticateUser, async
   });
 });
 
-// Full Database Bi-Directional Synchronization with Isolation Protection
-app.post(['/api/database/sync', '/api/sync', '/sync'], authenticateUser, (req: Request, res: Response) => {
-  const { data } = req.body;
-  if (!data || typeof data !== 'object') {
-    res.status(400).json({ error: 'Invalid database payload.' });
-    return;
+// Bulk browser-state sync has been retired: every change is saved record-by-record.
+app.post(['/api/database/sync', '/api/sync', '/sync'], authenticateUser, (_req: Request, res: Response) => {
+  res.status(410).json({ error: 'Bulk sync has been removed. Data is saved directly to Supabase per record.' });
+});
+
+// Generic record API for the collections defined in server/records.ts
+app.post('/api/records/:collection', authenticateUser, async (req: Request, res: Response) => {
+  try {
+    const saved = await records.saveRecord(serverSupabase!, req.user as any, req.params.collection, req.body?.record);
+    res.json({ success: true, record: saved });
+  } catch (err: any) {
+    const status = err instanceof records.RecordError ? err.status : 500;
+    if (status >= 500) console.error(`[Records] save ${req.params.collection} failed:`, err?.message || err);
+    res.status(status).json({ error: err?.message || 'Save failed.' });
   }
+});
 
-  const currentDb = getDatabaseState() || {};
-  const user = req.user;
-
-  // Campus admins can only update their own campus records
-  if (user && user.role !== 'SUPER_ADMIN') {
-    const allowed = user.allowedCampusIds || [user.activeCampusId];
-    // Merge only records matching allowed campus
-    const mergeScoped = (current: any[] = [], incoming: any[] = []) => {
-      const retainedOther = current.filter((item) => item.campusId && !allowed.includes(item.campusId));
-      const filteredIncoming = incoming.filter((item) => !item.campusId || allowed.includes(item.campusId));
-      return [...retainedOther, ...filteredIncoming];
-    };
-
-    const mergedDb = {
-      ...currentDb,
-      students: mergeScoped(currentDb.students, data.students),
-      teachers: mergeScoped(currentDb.teachers, data.teachers),
-      classes: mergeScoped(currentDb.classes, data.classes),
-      payments: mergeScoped(currentDb.payments, data.payments),
-      expenses: mergeScoped(currentDb.expenses, data.expenses),
-      teacherAttendance: mergeScoped(currentDb.teacherAttendance, data.teacherAttendance),
-      studentAttendance: mergeScoped(currentDb.studentAttendance, data.studentAttendance),
-      updatedAt: new Date().toISOString(),
-    };
-
-    const ok = saveDatabaseState(mergedDb);
-    if (ok) {
-      res.json({
-        success: true,
-        message: 'Campus-scoped database updates successfully committed.',
-        timestamp: new Date().toISOString(),
-      });
-    } else {
-      res.status(500).json({ error: 'Failed to write to persistent database.' });
-    }
-    return;
-  }
-
-  // Super Admin global sync
-  const mergedDb = {
-    ...currentDb,
-    ...data,
-    updatedAt: new Date().toISOString(),
-  };
-
-  const ok = saveDatabaseState(mergedDb);
-  if (ok) {
-    res.json({
-      success: true,
-      message: 'Database state successfully synchronized and committed to persistent storage.',
-      timestamp: new Date().toISOString(),
-    });
-  } else {
-    res.status(500).json({ error: 'Failed to write to persistent database.' });
+app.delete('/api/records/:collection/:id', authenticateUser, async (req: Request, res: Response) => {
+  try {
+    await records.deleteRecord(serverSupabase!, req.user as any, req.params.collection, req.params.id);
+    res.json({ success: true });
+  } catch (err: any) {
+    const status = err instanceof records.RecordError ? err.status : 500;
+    if (status >= 500) console.error(`[Records] delete ${req.params.collection} failed:`, err?.message || err);
+    res.status(status).json({ error: err?.message || 'Delete failed.' });
   }
 });
 
 // Database Migration & Data Verification Status
 app.get('/api/database/migration-status', (req: Request, res: Response) => {
-  const db = getDatabaseState();
   res.json({
     status: 'production_ready',
     campuses: ['uk', 'kts'],
@@ -921,13 +925,7 @@ app.get('/api/database/migration-status', (req: Request, res: Response) => {
     },
     cleanState: true,
     demoDataRemoved: true,
-    persistentRecords: {
-      studentsCount: db?.students?.length || 0,
-      teachersCount: db?.teachers?.length || 0,
-      usersCount: db?.users?.length || 0,
-      classesCount: db?.classes?.length || 0,
-      paymentsCount: db?.payments?.length || 0,
-    },
+    dataStore: 'supabase',
     attendanceRules: {
       timeBoundary5pm: 'PRESENT or ABSENT',
       timeBoundary530pm: 'LATE or ABSENT',
@@ -1052,6 +1050,7 @@ app.post('/api/auth/login', async (req: Request, res: Response) => {
         activeCampusId: appUser.campusId,
         allowedCampusIds: appUser.allowedCampusIds,
         teacherProfileId: appUser.teacherProfileId,
+        parentProfileId: appUser.parentProfileId,
       },
     });
   } catch (err: any) {
@@ -2321,6 +2320,7 @@ app.put('/api/students/:id', authenticateUser, async (req: Request, res: Respons
       if (updates.bloodGroup !== undefined) sbUpdates.blood_group = updates.bloodGroup || null;
       if (updates.medicalNotes !== undefined) sbUpdates.medical_notes = updates.medicalNotes || null;
       if (updates.quranMilestone !== undefined) sbUpdates.quran_milestone = updates.quranMilestone || null;
+      if (updates.portalAccessActive !== undefined) sbUpdates.portal_access_active = updates.portalAccessActive !== false;
       if (updates.primaryParentName !== undefined || updates.primaryParentPhone !== undefined) {
         // Merge with the stored contact so a partial edit (only name or only phone) keeps the other value.
         let currentContact: { name?: string; phone?: string } = {};
@@ -2937,7 +2937,17 @@ app.post('/api/users', authenticateUser, async (req: Request, res: Response) => 
 
       try {
         await authSvc.setCampusAccess(serverSupabase, userId, authSvc.campusIdsFor(campusId));
+        if (cleanRole === 'PARENT') {
+          const { error: parentErr } = await serverSupabase.from('parent_profiles').insert([{
+            id: `par-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+            user_id: userId,
+            campus_id: campusId && campusId !== 'all' ? campusId : 'uk',
+            phone: contactNumber || null,
+          }]);
+          if (parentErr) throw new Error(`Parent profile creation failed: ${parentErr.message}`);
+        }
       } catch (accessErr: any) {
+        await serverSupabase.from('user_campus_access').delete().eq('user_id', userId);
         await serverSupabase.from('users').delete().eq('id', userId);
         await authSvc.deleteAuthAccount(serverSupabase, authUserId);
         res.status(500).json({ error: accessErr.message });
@@ -3284,12 +3294,33 @@ app.post('/api/audit-logs', authenticateUser, async (req: Request, res: Response
 // ==============================================================================
 app.get('/api/incidents', authenticateUser, async (req: Request, res: Response) => {
   try {
+    const user = req.user!;
     const { campusId } = req.query;
-    const db = getDatabaseState() || {};
-    let incidents = db.incidents ? [...db.incidents] : [];
-    if (campusId && campusId !== 'all') {
-      if (!enforceCampusAccess(req, res, String(campusId))) return;
-      incidents = incidents.filter((i: any) => i.campusId === campusId);
+    if (campusId && campusId !== 'all' && !enforceCampusAccess(req, res, String(campusId))) return;
+    let query = serverSupabase!.from('incident_logs').select('*').order('created_at', { ascending: false });
+    if (campusId && campusId !== 'all') query = query.eq('campus_id', String(campusId));
+    else if (user.role !== 'SUPER_ADMIN') query = query.in('campus_id', user.allowedCampusIds);
+    const { data, error } = await query;
+    if (error) throw error;
+    const lk = await records.loadLookups(serverSupabase!);
+    let incidents = (data || [])
+      .filter((log: any) => !String(log.title || '').startsWith('[MEDICAL]'))
+      .map((log: any) => {
+        let attachedFiles: any;
+        try { attachedFiles = log.attachments ? JSON.parse(log.attachments) : undefined; } catch { attachedFiles = undefined; }
+        const title = String(log.title || '');
+        const type = title.includes('[ACADEMIC]') ? 'ACADEMIC' : title.includes('[INJURY]') ? 'INJURY' : 'BEHAVIORAL';
+        return {
+          id: log.id, campusId: log.campus_id, studentId: log.student_id || '',
+          studentName: lk.student.get(log.student_id)?.name || 'Student', reporterId: 'staff', reporterName: 'Staff Member',
+          type, severity: 'MEDIUM', description: log.description || title, actionTaken: log.action_taken || '',
+          status: log.status || 'SUBMITTED', createdAt: String(log.created_at || '').replace('T', ' ').substring(0, 19), attachedFiles,
+        };
+      });
+    if (user.role === 'PARENT') {
+      const { data: kids } = await serverSupabase!.from('students').select('id').eq('parent_id', user.id);
+      const ids = new Set((kids || []).map((k: any) => k.id));
+      incidents = incidents.filter((i: any) => ids.has(i.studentId));
     }
     res.json({ success: true, data: incidents });
   } catch (err: any) {
@@ -3400,14 +3431,20 @@ app.put('/api/incidents/:id/status', authenticateUser, async (req: Request, res:
 
 app.get('/api/medicals', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const { campusId } = req.query;
-    const db = getDatabaseState() || {};
-    let medicals = db.medicalRecords ? [...db.medicalRecords] : [];
-    if (campusId && campusId !== 'all') {
-      if (!enforceCampusAccess(req, res, String(campusId))) return;
-      medicals = medicals.filter((m: any) => m.campusId === campusId);
+    const user = req.user!;
+    if (user.role === 'PARENT') {
+      res.status(403).json({ error: 'Forbidden: medical records are visible to staff only.' });
+      return;
     }
-    res.json({ success: true, data: medicals });
+    const { campusId } = req.query;
+    if (campusId && campusId !== 'all' && !enforceCampusAccess(req, res, String(campusId))) return;
+    let query = serverSupabase!.from('medical_records').select('*').order('created_at', { ascending: false });
+    if (campusId && campusId !== 'all') query = query.eq('campus_id', String(campusId));
+    else if (user.role !== 'SUPER_ADMIN') query = query.in('campus_id', user.allowedCampusIds);
+    const { data, error } = await query;
+    if (error) throw error;
+    const lk = await records.loadLookups(serverSupabase!);
+    res.json({ success: true, data: (data || []).map((row: any) => records.COLLECTIONS.medicalRecords.fromRow(row, lk)) });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to load medical records.' });
   }
@@ -3451,42 +3488,19 @@ app.post('/api/medicals', authenticateUser, async (req: Request, res: Response) 
     }
     saveDatabaseState(db);
 
-    // Supabase persistence: store in incident_logs with [MEDICAL] title & update students table
-    if (serverSupabase) {
-      try {
-        const descPayload = JSON.stringify({
-          condition,
-          severity: severity || 'HIGH',
-          allergies: allergies || '',
-          medicationNotes: medicationNotes || '',
-          emergencyContact: emergencyContact || '',
-          reportedBy: user.fullName || user.email || 'Staff',
-        });
-
-        const { error: sbWriteErr } = await serverSupabase.from('incident_logs').upsert([{
-          id: medId,
-          campus_id: campusId,
-          student_id: studentId,
-          date: nowIso.split('T')[0],
-          title: `[MEDICAL] Condition: ${condition}`,
-          description: descPayload,
-          action_taken: emergencyContact ? `Emergency Contact: ${emergencyContact}` : 'Medical Alert Recorded',
-          status: 'SUBMITTED',
-          created_at: nowIso,
-          updated_at: nowIso,
-        }]);
-        if (sbWriteErr) throw sbWriteErr;
-
-        // Keep the student's summary medical notes in sync.
-        const { error: notesErr } = await serverSupabase.from('students').update({
-          medical_notes: `Condition: ${condition}; Allergies: ${allergies || 'None'}; Emergency: ${emergencyContact || ''}`,
-        }).eq('id', studentId);
-        if (notesErr) throw notesErr;
-      } catch (sbErr: any) {
-        console.error('[Server Supabase] medical record sync error:', sbErr);
-        res.status(502).json({ error: `Medical record was not saved to the database: ${sbErr?.message || 'network error'}` });
-        return;
-      }
+    // Supabase persistence: medical_records + the student's summary notes.
+    try {
+      const saved = await records.saveRecord(serverSupabase!, user as any, 'medicalRecords', medicalEntry);
+      Object.assign(medicalEntry, saved);
+      const { error: notesErr } = await serverSupabase!.from('students').update({
+        medical_notes: `Condition: ${condition}; Allergies: ${allergies || 'None'}; Emergency: ${emergencyContact || ''}`,
+      }).eq('id', studentId);
+      if (notesErr) throw notesErr;
+    } catch (sbErr: any) {
+      console.error('[Server Supabase] medical record save error:', sbErr?.message || sbErr);
+      const status = sbErr instanceof records.RecordError ? sbErr.status : 502;
+      res.status(status).json({ error: `Medical record was not saved to the database: ${sbErr?.message || 'network error'}` });
+      return;
     }
 
     res.json({ success: true, medicalRecord: medicalEntry });
@@ -3510,94 +3524,85 @@ const ALLOWED_MIME_TYPES = [
 
 const MAX_DOCUMENT_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
 
+const DOCUMENTS_BUCKET = 'misbah-documents';
+
+/** Maps a documents row to the shape the app uses. */
+function mapDocumentRow(d: any) {
+  const ext = d.name?.includes('.') ? d.name.split('.').pop()!.toLowerCase() : '';
+  const mime = d.mime_type || '';
+  let fileType = 'PDF';
+  if (mime.startsWith('image/') || ['png', 'jpg', 'jpeg', 'webp'].includes(ext)) fileType = 'IMAGE';
+  else if (mime.includes('word') || ['doc', 'docx'].includes(ext)) fileType = 'DOC';
+  return {
+    id: d.id,
+    entityType: String(d.type || 'student').toUpperCase(),
+    entityId: d.reference_id,
+    campusId: d.campus_id,
+    name: d.name,
+    category: d.category || 'OTHER',
+    sizeBytes: d.size_bytes ?? undefined,
+    sizeMb: d.size_bytes ? Number((d.size_bytes / (1024 * 1024)).toFixed(2)) : 0,
+    type: fileType,
+    mimeType: mime || undefined,
+    storageBucket: d.storage_bucket || null,
+    fileAvailable: Boolean(d.storage_bucket && d.file_name),
+    uploadedAt: d.created_at,
+    uploadedById: d.uploaded_by || undefined,
+    url: `/api/documents/${d.id}/download`,
+  };
+}
+
+/**
+ * Whether the signed-in user may see a document. Admins: their campuses. Teachers: their own
+ * documents and documents of students in classes they lead. Parents: their children's documents.
+ */
+async function canAccessDocument(user: RequestUser, doc: any): Promise<boolean> {
+  if (user.role === 'SUPER_ADMIN') return true;
+  if (!user.allowedCampusIds.includes(doc.campus_id)) return false;
+  if (user.role === 'CAMPUS_ADMIN') return true;
+  const entityType = String(doc.type || '').toLowerCase();
+  if (user.role === 'TEACHER') {
+    if (entityType === 'teacher') return doc.reference_id === user.id || doc.reference_id === user.teacherProfileId;
+    if (entityType === 'student') {
+      const { data } = await serverSupabase!
+        .from('students').select('class_id, classes!inner(teacher_id)').eq('id', doc.reference_id).maybeSingle();
+      return Boolean(data && (data as any).classes?.teacher_id === user.id);
+    }
+    return true; // incident attachments etc. within their campus
+  }
+  if (user.role === 'PARENT') {
+    if (entityType !== 'student') return false;
+    const { data } = await serverSupabase!.from('students').select('parent_id').eq('id', doc.reference_id).maybeSingle();
+    return data?.parent_id === user.id;
+  }
+  return false;
+}
+
+async function loadDocumentRow(id: string) {
+  const { data, error } = await serverSupabase!.from('documents').select('*').eq('id', id).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
 app.get('/api/documents', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const { entityType, entityId, campusId } = req.query;
-    const db = getDatabaseState() || {};
-    let docs: any[] = db.documents ? [...db.documents] : [];
-
-    // Query authoritative Supabase documents table
-    if (serverSupabase) {
-      try {
-        let sbQuery = serverSupabase.from('documents').select('*');
-        if (entityType) {
-          sbQuery = sbQuery.eq('type', String(entityType).toLowerCase());
-        }
-        if (entityId) {
-          sbQuery = sbQuery.eq('reference_id', String(entityId));
-        }
-        if (campusId && campusId !== 'all') {
-          sbQuery = sbQuery.eq('campus_id', String(campusId));
-        }
-        const { data: sbDocs } = await sbQuery;
-        if (sbDocs && Array.isArray(sbDocs)) {
-          sbDocs.forEach((d: any) => {
-            const alreadyInLocal = docs.some((ld: any) => ld.id === d.id);
-            if (!alreadyInLocal) {
-              const ext = d.name?.includes('.') ? d.name.split('.').pop()!.toLowerCase() : 'pdf';
-              let detectedType = 'PDF';
-              if (['png', 'jpg', 'jpeg', 'webp'].includes(ext)) detectedType = 'IMAGE';
-              else if (['doc', 'docx'].includes(ext)) detectedType = 'DOC';
-
-              docs.push({
-                id: d.id,
-                entityType: (d.type || 'STUDENT').toUpperCase(),
-                entityId: d.reference_id,
-                campusId: d.campus_id || 'uk',
-                name: d.name,
-                category: 'OTHER',
-                sizeMb: 1.0,
-                type: detectedType,
-                storagePath: d.file_name,
-                storageBucket: 'misbah-documents',
-                uploadedAt: d.created_at || new Date().toISOString(),
-                url: `/api/documents/${d.id}/download`,
-              });
-            }
-          });
-        }
-      } catch (sbErr) {
-        console.warn('[Server Supabase] documents fetch notice:', sbErr);
-      }
-    }
-
-    if (entityType) {
-      docs = docs.filter((d: any) => String(d.entityType).toUpperCase() === String(entityType).toUpperCase());
-    }
-    if (entityId) {
-      docs = docs.filter((d: any) => d.entityId === entityId);
-    }
-    if (campusId && campusId !== 'all') {
-      if (!enforceCampusAccess(req, res, String(campusId))) return;
-      docs = docs.filter((d: any) => d.campusId === campusId || !d.campusId);
-    }
-
-    // Role-based document access enforcement
     const user = req.user!;
-    if (user.role === 'PARENT') {
-      // Parents can only see documents belonging to their linked children
-      const linkedStudents = (db.students || []).filter((s: any) => Array.isArray(s.parentIds) && s.parentIds.includes(user.id));
-      const allowedStudentIds = linkedStudents.map((s: any) => s.id);
-      docs = docs.filter((d: any) => d.entityType === 'STUDENT' && allowedStudentIds.includes(d.entityId));
-    } else if (user.role === 'TEACHER') {
-      // Teachers can only view documents for students in their assigned classes or their own teacher docs
-      const teacherProfile = (db.teachers || []).find((t: any) => t.userId === user.id || t.id === user.id);
-      const assignedClassIds = teacherProfile?.assignedClassIds || [];
-      const accessibleStudentIds = (db.students || [])
-        .filter((s: any) => assignedClassIds.includes(s.classId))
-        .map((s: any) => s.id);
-      docs = docs.filter(
-        (d: any) =>
-          (d.entityType === 'TEACHER' && (d.entityId === teacherProfile?.id || d.entityId === user.id)) ||
-          (d.entityType === 'STUDENT' && accessibleStudentIds.includes(d.entityId))
-      );
-    } else if (user.role === 'CAMPUS_ADMIN') {
-      docs = docs.filter((d: any) => user.allowedCampusIds.includes(d.campusId));
-    }
+    const { entityType, entityId, campusId } = req.query;
+    if (campusId && campusId !== 'all' && !enforceCampusAccess(req, res, String(campusId))) return;
 
-    // Strip heavy binary content from listing response
-    const sanitizedDocs = docs.map(({ fileData, ...meta }) => meta);
-    res.json({ success: true, documents: sanitizedDocs });
+    let query = serverSupabase!.from('documents').select('*').order('created_at', { ascending: false });
+    if (entityType) query = query.eq('type', String(entityType).toLowerCase());
+    if (entityId) query = query.eq('reference_id', String(entityId));
+    if (campusId && campusId !== 'all') query = query.eq('campus_id', String(campusId));
+    else if (user.role !== 'SUPER_ADMIN') query = query.in('campus_id', user.allowedCampusIds);
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const visible: any[] = [];
+    for (const row of data || []) {
+      if (await canAccessDocument(user, row)) visible.push(mapDocumentRow(row));
+    }
+    res.json({ success: true, documents: visible });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to fetch documents.' });
   }
@@ -3606,370 +3611,164 @@ app.get('/api/documents', authenticateUser, async (req: Request, res: Response) 
 app.post('/api/documents/upload', authenticateUser, async (req: Request, res: Response) => {
   try {
     const user = req.user!;
-    const {
-      entityType,
-      entityId,
-      campusId,
-      name,
-      category,
-      mimeType,
-      sizeBytes,
-      fileBase64,
-    } = req.body;
+    const { entityType, entityId, campusId, name, category, mimeType, fileBase64 } = req.body || {};
 
     if (!entityType || !entityId) {
       res.status(400).json({ error: 'entityType (STUDENT or TEACHER) and entityId are required.' });
       return;
     }
-
     if (!name || !fileBase64) {
       res.status(400).json({ error: 'Document name and file data payload are required.' });
       return;
     }
-
-    const cleanMimeType = (mimeType || 'application/pdf').toLowerCase();
+    const cleanMimeType = String(mimeType || 'application/pdf').toLowerCase();
     if (!ALLOWED_MIME_TYPES.includes(cleanMimeType)) {
-      res.status(400).json({
-        error: `File format "${cleanMimeType}" is not supported. Allowed formats: PDF, DOC, DOCX, PNG, JPG/JPEG, WEBP.`,
-      });
+      res.status(400).json({ error: `File format "${cleanMimeType}" is not supported. Allowed formats: PDF, DOC, DOCX, PNG, JPG/JPEG, WEBP.` });
+      return;
+    }
+    const fileBuffer = Buffer.from(String(fileBase64), 'base64');
+    if (fileBuffer.length === 0) {
+      res.status(400).json({ error: 'The uploaded file is empty.' });
+      return;
+    }
+    if (fileBuffer.length > MAX_DOCUMENT_SIZE_BYTES) {
+      res.status(400).json({ error: `File size exceeds the 25MB limit. Received: ${(fileBuffer.length / (1024 * 1024)).toFixed(1)}MB.` });
       return;
     }
 
-    const byteLength = Number(sizeBytes) || Buffer.byteLength(fileBase64, 'base64');
-    if (byteLength > MAX_DOCUMENT_SIZE_BYTES) {
-      res.status(400).json({
-        error: `File size exceeds the 25MB safety threshold. Received: ${(byteLength / (1024 * 1024)).toFixed(1)}MB.`,
-      });
-      return;
-    }
+    const targetCampus = String(campusId || user.activeCampusId || 'uk').toLowerCase();
+    if (!enforceCampusAccess(req, res, targetCampus)) return;
 
-    const targetCampus = (campusId || user.activeCampusId || 'uk').toLowerCase();
-    if (!enforceCampusAccess(req, res, targetCampus)) {
+    const cleanEntityType = String(entityType).toLowerCase();
+    // Authorization: same rules as viewing, applied to the document being created.
+    const allowed = await canAccessDocument(user, { campus_id: targetCampus, type: cleanEntityType, reference_id: entityId });
+    if (!allowed) {
+      res.status(403).json({ error: 'Forbidden: you cannot upload documents for this record.' });
       return;
-    }
-
-    // Authorization check by role
-    const db = getDatabaseState() || {};
-    if (user.role === 'PARENT') {
-      const student = (db.students || []).find((s: any) => s.id === entityId);
-      const isParent = student && Array.isArray(student.parentIds) && student.parentIds.includes(user.id);
-      if (!isParent) {
-        res.status(403).json({ error: 'Forbidden: Parents can only upload documents for their verified linked children.' });
-        return;
-      }
-    } else if (user.role === 'TEACHER') {
-      const teacherProfile = (db.teachers || []).find((t: any) => t.userId === user.id || t.id === user.id);
-      if (entityType === 'TEACHER' && entityId !== teacherProfile?.id && entityId !== user.id) {
-        res.status(403).json({ error: 'Forbidden: Teachers can only upload their own employment documents.' });
-        return;
-      }
     }
 
     const docId = `doc-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const sizeMb = Number((byteLength / (1024 * 1024)).toFixed(2));
-    const extension = name.includes('.') ? name.split('.').pop()!.toLowerCase() : 'pdf';
-    let detectedType = 'PDF';
-    if (cleanMimeType.startsWith('image/')) detectedType = 'IMAGE';
-    else if (cleanMimeType.includes('word') || cleanMimeType.includes('doc')) detectedType = 'DOC';
+    const safeName = String(name).trim().replace(/[^a-zA-Z0-9._-]/g, '_');
+    const storagePath = `${targetCampus}/${cleanEntityType}s/${entityId}/${docId}-${safeName}`;
 
-    // Build storage object path: e.g. "students/std-uk-01/1793179200-birth_cert.pdf"
-    const storagePath = `${entityType.toLowerCase()}s/${entityId}/${Date.now()}-${name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
-
-    // Attempt Supabase Storage Upload if storage bucket exists
-    let storageUploaded = false;
-    if (serverSupabase) {
-      try {
-        const fileBuffer = Buffer.from(fileBase64, 'base64');
-        const { error: uploadErr } = await serverSupabase.storage
-          .from('misbah-documents')
-          .upload(storagePath, fileBuffer, {
-            contentType: cleanMimeType,
-            upsert: true,
-          });
-
-        if (!uploadErr) {
-          storageUploaded = true;
-        } else {
-          console.warn('[Server Supabase Storage] Bucket upload note (falling back to durable DB storage):', uploadErr.message);
-        }
-      } catch (sbStorageErr) {
-        console.warn('[Server Supabase Storage] Storage API notice:', sbStorageErr);
-      }
+    const { error: uploadErr } = await serverSupabase!.storage
+      .from(DOCUMENTS_BUCKET)
+      .upload(storagePath, fileBuffer, { contentType: cleanMimeType, upsert: false });
+    if (uploadErr) {
+      console.error('[Documents] Storage upload failed:', uploadErr.message);
+      res.status(502).json({ error: `The file could not be stored: ${uploadErr.message}` });
+      return;
     }
 
-    const documentEntry: any = {
+    const { data: row, error: insertErr } = await serverSupabase!.from('documents').insert([{
       id: docId,
-      entityType: String(entityType).toUpperCase(),
-      entityId,
-      campusId: targetCampus,
-      name: name.trim(),
+      campus_id: targetCampus,
+      type: cleanEntityType,
+      reference_id: String(entityId),
+      name: String(name).trim(),
+      file_name: storagePath,
       category: category || 'OTHER',
-      sizeMb,
-      sizeBytes: byteLength,
-      type: detectedType,
-      mimeType: cleanMimeType,
-      extension,
-      storagePath,
-      storageBucket: storageUploaded ? 'misbah-documents' : null,
-      uploadedAt: new Date().toISOString(),
-      uploadedBy: user.fullName || user.email || 'Admin',
-      uploaderRole: user.role,
-      fileData: fileBase64, // Durable payload preservation
-    };
-
-    if (!db.documents) db.documents = [];
-    db.documents.unshift(documentEntry);
-
-    // Synchronize document reference onto the student or teacher record
-    if (entityType.toUpperCase() === 'STUDENT' && db.students) {
-      const std = db.students.find((s: any) => s.id === entityId);
-      if (std) {
-        if (!std.documents) std.documents = [];
-        std.documents.unshift({
-          id: docId,
-          name: documentEntry.name,
-          category: documentEntry.category,
-          sizeMb,
-          type: detectedType,
-          mimeType: cleanMimeType,
-          uploadedAt: documentEntry.uploadedAt,
-          url: `/api/documents/${docId}/download`,
-        });
-      }
-    } else if (entityType.toUpperCase() === 'TEACHER' && db.teachers) {
-      const tch = db.teachers.find((t: any) => t.id === entityId || t.userId === entityId);
-      if (tch) {
-        if (!tch.documents) tch.documents = [];
-        tch.documents.unshift({
-          id: docId,
-          name: documentEntry.name,
-          category: documentEntry.category,
-          sizeMb,
-          type: detectedType,
-          mimeType: cleanMimeType,
-          uploadedAt: documentEntry.uploadedAt,
-          url: `/api/documents/${docId}/download`,
-        });
-      }
+      mime_type: cleanMimeType,
+      size_bytes: fileBuffer.length,
+      storage_bucket: DOCUMENTS_BUCKET,
+      uploaded_by: user.id,
+    }]).select().single();
+    if (insertErr) {
+      // Keep storage and metadata consistent.
+      await serverSupabase!.storage.from(DOCUMENTS_BUCKET).remove([storagePath]);
+      console.error('[Documents] Metadata insert failed:', insertErr.message);
+      res.status(502).json({ error: `Document record was not saved to the database: ${insertErr.message}` });
+      return;
     }
 
-    saveDatabaseState(db);
-
-    // Authoritative Supabase Database & Storage synchronization
-    if (serverSupabase) {
-      try {
-        const { error: sbWriteErr } = await serverSupabase.from('documents').upsert([{
-          id: docId,
-          campus_id: targetCampus,
-          type: entityType.toLowerCase(),
-          reference_id: entityId,
-          name: name.trim(),
-          file_name: storagePath,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        }]);
-        if (sbWriteErr) throw sbWriteErr;
-      } catch (dbDocErr: any) {
-        console.error('[Server Supabase] documents upsert notice:', dbDocErr);
-        res.status(502).json({ error: `Document record was not saved to the database: ${dbDocErr?.message || 'network error'}` });
-        return;
-      }
-
-      // Record audit log entry in Supabase
-      try {
-        await serverSupabase.from('audit_logs').insert([{
-          campus_id: targetCampus,
-          user_id: user.id && user.id.startsWith('usr-') ? user.id : null,
-          action: 'DOCUMENT_UPLOADED',
-          entity_type: entityType,
-          entity_id: entityId,
-          reason: `Document "${documentEntry.name}" uploaded for ${entityType} ${entityId} by ${user.email}`,
-          details: {
-            document_id: docId,
-            document_name: documentEntry.name,
-            entity_type: entityType,
-            entity_id: entityId,
-            uploaded_by: user.email,
-            file_size_mb: sizeMb,
-          },
-        }]);
-      } catch {
-        // non-blocking
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `Document "${documentEntry.name}" successfully uploaded and verified.`,
-      document: {
-        id: docId,
-        name: documentEntry.name,
-        category: documentEntry.category,
-        sizeMb,
-        type: detectedType,
-        mimeType: cleanMimeType,
-        uploadedAt: documentEntry.uploadedAt,
-        uploadedBy: documentEntry.uploadedBy,
-        url: `/api/documents/${docId}/download`,
+    await serverSupabase!.from('audit_logs').insert([{
+      campus_id: targetCampus,
+      user_id: user.id,
+      action: 'DOCUMENT_UPLOADED',
+      details: {
+        entity_type: cleanEntityType,
+        entity_id: entityId,
+        document_id: docId,
+        document_name: row.name,
+        size_bytes: fileBuffer.length,
+        uploaded_by: user.email,
       },
-    });
+    }]);
+
+    const document = { ...mapDocumentRow(row), uploadedBy: user.fullName || user.email };
+    res.json({ success: true, message: `Document "${row.name}" uploaded.`, document });
   } catch (err: any) {
-    console.error('[Server Document Upload Error]:', err);
+    console.error('[Documents] Upload error:', err?.message || err);
     res.status(500).json({ error: err?.message || 'Failed to upload document.' });
   }
 });
 
-app.get('/api/documents/:id/download', authenticateUser, async (req: Request, res: Response) => {
+/** Streams a stored file (download or inline view). */
+async function sendDocumentFile(req: Request, res: Response, disposition: 'attachment' | 'inline') {
   try {
-    const { id } = req.params;
-    const db = getDatabaseState() || {};
-    const doc = (db.documents || []).find((d: any) => d.id === id);
-
+    const doc = await loadDocumentRow(req.params.id);
     if (!doc) {
       res.status(404).json({ error: 'Document not found.' });
       return;
     }
-
-    if (doc.campusId && !enforceCampusAccess(req, res, doc.campusId)) {
+    if (!(await canAccessDocument(req.user!, doc))) {
+      res.status(403).json({ error: 'Forbidden: you cannot access this document.' });
       return;
     }
-
-    // Check Supabase Storage first if object was stored in bucket
-    if (serverSupabase && doc.storageBucket && doc.storagePath) {
-      try {
-        const { data: fileBlob, error: downloadErr } = await serverSupabase.storage
-          .from(doc.storageBucket)
-          .download(doc.storagePath);
-
-        if (!downloadErr && fileBlob) {
-          const buffer = Buffer.from(await fileBlob.arrayBuffer());
-          res.setHeader('Content-Type', doc.mimeType || 'application/octet-stream');
-          res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name)}"`);
-          res.setHeader('Content-Length', buffer.length);
-          res.send(buffer);
-          return;
-        }
-      } catch (storageErr) {
-        console.warn('[Server Storage Download] Notice, trying local fallback:', storageErr);
-      }
-    }
-
-    // Serve from fileData payload
-    if (doc.fileData) {
-      const buffer = Buffer.from(doc.fileData, 'base64');
-      res.setHeader('Content-Type', doc.mimeType || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name)}"`);
-      res.setHeader('Content-Length', buffer.length);
-      res.send(buffer);
+    if (!doc.storage_bucket || !doc.file_name) {
+      res.status(404).json({ error: 'This document was recorded before file storage existed; the file is not available.' });
       return;
     }
-
-    res.status(404).json({ error: 'Document file contents unavailable for download.' });
+    const { data: blob, error } = await serverSupabase!.storage.from(doc.storage_bucket).download(doc.file_name);
+    if (error || !blob) {
+      res.status(404).json({ error: `File not found in storage: ${error?.message || 'missing object'}` });
+      return;
+    }
+    const buffer = Buffer.from(await blob.arrayBuffer());
+    res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `${disposition}; filename="${encodeURIComponent(doc.name)}"`);
+    res.setHeader('Content-Length', buffer.length);
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(buffer);
   } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Failed to download document.' });
+    res.status(500).json({ error: err?.message || 'Failed to read document.' });
   }
-});
+}
 
-app.get('/api/documents/:id/view', authenticateUser, async (req: Request, res: Response) => {
-  try {
-    const { id } = req.params;
-    const db = getDatabaseState() || {};
-    const doc = (db.documents || []).find((d: any) => d.id === id);
-
-    if (!doc) {
-      res.status(404).json({ error: 'Document not found.' });
-      return;
-    }
-
-    if (doc.campusId && !enforceCampusAccess(req, res, doc.campusId)) {
-      return;
-    }
-
-    if (serverSupabase && doc.storageBucket && doc.storagePath) {
-      try {
-        const { data: signedData, error: signErr } = await serverSupabase.storage
-          .from(doc.storageBucket)
-          .createSignedUrl(doc.storagePath, 300); // 5 min expiry
-
-        if (!signErr && signedData?.signedUrl) {
-          res.redirect(signedData.signedUrl);
-          return;
-        }
-      } catch (signedErr) {
-        console.warn('[Server Signed URL] Notice, streaming file directly:', signedErr);
-      }
-    }
-
-    if (doc.fileData) {
-      const buffer = Buffer.from(doc.fileData, 'base64');
-      res.setHeader('Content-Type', doc.mimeType || 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(doc.name)}"`);
-      res.setHeader('Content-Length', buffer.length);
-      res.send(buffer);
-      return;
-    }
-
-    res.status(404).json({ error: 'Document contents not available for inline viewing.' });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Failed to view document.' });
-  }
-});
+app.get('/api/documents/:id/download', authenticateUser, (req: Request, res: Response) => sendDocumentFile(req, res, 'attachment'));
+app.get('/api/documents/:id/view', authenticateUser, (req: Request, res: Response) => sendDocumentFile(req, res, 'inline'));
 
 app.delete('/api/documents/:id', authenticateUser, async (req: Request, res: Response) => {
   try {
-    const { id } = req.params;
     const user = req.user!;
-    const db = getDatabaseState() || {};
-    const doc = (db.documents || []).find((d: any) => d.id === id);
-
+    const doc = await loadDocumentRow(req.params.id);
     if (!doc) {
       res.status(404).json({ error: 'Document not found.' });
       return;
     }
-
-    if (doc.campusId && !enforceCampusAccess(req, res, doc.campusId)) {
+    if (!(await canAccessDocument(user, doc))) {
+      res.status(403).json({ error: 'Forbidden: you cannot access this document.' });
       return;
     }
-
-    // Role check: Only SUPER_ADMIN, CAMPUS_ADMIN, or original uploader can delete
-    if (user.role !== 'SUPER_ADMIN' && user.role !== 'CAMPUS_ADMIN' && doc.uploadedBy !== user.email) {
-      res.status(403).json({ error: 'Forbidden: Insufficient permissions to delete this document.' });
+    if (user.role !== 'SUPER_ADMIN' && user.role !== 'CAMPUS_ADMIN' && doc.uploaded_by !== user.id) {
+      res.status(403).json({ error: 'Forbidden: only administrators or the uploader can delete this document.' });
       return;
     }
-
-    // Delete from Supabase Storage and documents table
-    if (serverSupabase) {
-      if (doc.storageBucket && doc.storagePath) {
-        try {
-          await serverSupabase.storage.from(doc.storageBucket).remove([doc.storagePath]);
-        } catch (err) {
-          console.warn('[Server Storage Remove] Non-fatal storage deletion notice:', err);
-        }
-      }
-      try {
-        await serverSupabase.from('documents').delete().eq('id', id);
-      } catch (err) {
-        console.warn('[Server Database] documents deletion notice:', err);
-      }
+    const { error: delErr } = await serverSupabase!.from('documents').delete().eq('id', doc.id);
+    if (delErr) {
+      res.status(500).json({ error: `Document could not be deleted: ${delErr.message}` });
+      return;
     }
-
-    db.documents = (db.documents || []).filter((d: any) => d.id !== id);
-
-    // Unlink from student or teacher record
-    if (doc.entityType === 'STUDENT' && db.students) {
-      const std = db.students.find((s: any) => s.id === doc.entityId);
-      if (std && std.documents) {
-        std.documents = std.documents.filter((d: any) => d.id !== id);
-      }
-    } else if (doc.entityType === 'TEACHER' && db.teachers) {
-      const tch = db.teachers.find((t: any) => t.id === doc.entityId || t.userId === doc.entityId);
-      if (tch && tch.documents) {
-        tch.documents = tch.documents.filter((d: any) => d.id !== id);
-      }
+    if (doc.storage_bucket && doc.file_name) {
+      const { error: rmErr } = await serverSupabase!.storage.from(doc.storage_bucket).remove([doc.file_name]);
+      if (rmErr) console.error('[Documents] Storage removal failed (metadata already deleted):', rmErr.message);
     }
-
-    saveDatabaseState(db);
-
+    await serverSupabase!.from('audit_logs').insert([{
+      campus_id: doc.campus_id,
+      user_id: user.id,
+      action: 'DOCUMENT_DELETED',
+      details: { entity_type: doc.type, entity_id: doc.reference_id, document_id: doc.id, document_name: doc.name },
+    }]);
     res.json({ success: true, message: `Document "${doc.name}" deleted successfully.` });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to delete document.' });

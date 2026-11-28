@@ -545,15 +545,15 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
                 <div className="flex items-center justify-between">
                   <div className="flex items-center space-x-2">
                     <Server className="w-4 h-4 text-emerald-800" />
-                    <span className="font-bold text-xs text-[#0D381E]">Primary Server Database Ledger</span>
+                    <span className="font-bold text-xs text-[#0D381E]">Records loaded for this session</span>
                   </div>
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-900 border border-emerald-300">
-                    ● Connected & Writing
+                    ● From Supabase
                   </span>
                 </div>
                 <p className="text-[11px] text-[#57655B]">
-                  Storage Target: <code className="bg-white px-1.5 py-0.5 rounded border border-[#E6E2D8] text-[10px] text-[#0D381E]">data/ims_database.json</code> & Browser LocalStorage.
-                  Every student, teacher, class, and payment added is immediately committed.
+                  All records are read from and saved directly to Supabase PostgreSQL. Nothing is stored in this browser
+                  or on the server's disk; counts below are what your account can see.
                 </p>
                 <div className="grid grid-cols-3 gap-2 pt-2 border-t border-emerald-200/60 text-center text-xs">
                   <div className="bg-white p-2 rounded-lg border border-emerald-100">
@@ -600,12 +600,12 @@ export const SystemSettingsView: React.FC<SystemSettingsViewProps> = ({
                 </div>
                 <p className="text-[11px] text-[#57655B]">
                   {isSupabaseConfigured
-                    ? 'Connected to your remote Supabase cloud database. All transactions are mirrored to PostgreSQL.'
-                    : 'When you are ready to mirror live data to Supabase cloud, configure VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in your .env configuration.'}
+                    ? 'Supabase is the only data store: records in PostgreSQL, uploaded files in the private "misbah-documents" storage bucket.'
+                    : 'Supabase is not configured. The app cannot load or save data until VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY are set in .env.'}
                 </p>
                 <div className="p-2.5 bg-white rounded-lg border border-[#E6E2D8] text-[11px] text-[#57655B] space-y-1">
-                  <div>Status: <strong className={isSupabaseConfigured ? 'text-emerald-700' : 'text-amber-700'}>{isSupabaseConfigured ? 'Active Cloud Sync' : 'Operating on Verified Server Storage Ledger'}</strong></div>
-                  <div>Fallback: <span>Zero data loss guaranteed by dual local/server file ledger</span></div>
+                  <div>Status: <strong className={isSupabaseConfigured ? 'text-emerald-700' : 'text-amber-700'}>{isSupabaseConfigured ? 'Connected' : 'Not configured'}</strong></div>
+                  <div>Backups: <span>run <code>npm run db:backup</code> (see docs/database/BACKUP_RECOVERY.md)</span></div>
                 </div>
               </div>
             </div>

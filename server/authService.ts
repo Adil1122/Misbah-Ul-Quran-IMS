@@ -26,6 +26,7 @@ export interface AppAuthUser {
   allowedCampusIds: string[];
   isActive: boolean;
   teacherProfileId?: string;
+  parentProfileId?: string;
 }
 
 /** Escapes a value for use inside a PostgREST ILIKE pattern so it matches literally. */
@@ -47,7 +48,7 @@ async function loadCampusIds(admin: SupabaseClient, userId: string, fallback: st
   return fallback ? [fallback] : [];
 }
 
-function toAppUser(row: any, campusIds: string[], teacherProfileId?: string): AppAuthUser {
+function toAppUser(row: any, campusIds: string[], teacherProfileId?: string, parentProfileId?: string): AppAuthUser {
   const fullName = `${row.first_name || ''} ${row.last_name || ''}`.trim() || row.email || row.username || row.id;
   const allowed = campusIds.includes('all') ? ['all', ...campusIds.filter((c) => c !== 'all')] : campusIds;
   return {
@@ -61,6 +62,7 @@ function toAppUser(row: any, campusIds: string[], teacherProfileId?: string): Ap
     allowedCampusIds: allowed.length > 0 ? allowed : ['all'],
     isActive: row.status === 1 || row.status === true || row.status === 'active',
     teacherProfileId,
+    parentProfileId,
   };
 }
 
@@ -68,11 +70,12 @@ function toAppUser(row: any, campusIds: string[], teacherProfileId?: string): Ap
 export async function loadAppUserByAuthId(admin: SupabaseClient, authUserId: string): Promise<AppAuthUser | null> {
   const { data: row, error } = await admin.from('users').select('*').eq('auth_user_id', authUserId).maybeSingle();
   if (error || !row) return null;
-  const [campusIds, profile] = await Promise.all([
+  const [campusIds, profile, parent] = await Promise.all([
     loadCampusIds(admin, row.id, row.active_campus_id),
     admin.from('teacher_profiles').select('id').eq('teacher_id', row.id).maybeSingle(),
+    admin.from('parent_profiles').select('id').eq('user_id', row.id).maybeSingle(),
   ]);
-  return toAppUser(row, campusIds, profile.data?.id);
+  return toAppUser(row, campusIds, profile.data?.id, parent.data?.id);
 }
 
 /** Verifies a bearer token with Supabase Auth and returns the linked application user. */

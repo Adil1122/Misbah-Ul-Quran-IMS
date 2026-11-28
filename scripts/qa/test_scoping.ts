@@ -3,7 +3,8 @@
  * database-verified campus checks, and Supabase as the single source of truth.
  * Usage: npm run dev   (in another terminal)  then  npm run test:scoping
  */
-import { admin, api, check, createQaUser, readJson, requireServer, runSuite, section } from './helpers.ts';
+import fs from 'fs';
+import { admin, api, check, createQaUser, requireServer, runSuite, section } from './helpers.ts';
 
 runSuite('Scoping suite', async () => {
   await requireServer();
@@ -45,10 +46,8 @@ runSuite('Scoping suite', async () => {
   const { data: after } = await admin.from('students').select('first_name').eq('id', ktsStudent.id).single();
   check('KTS student unchanged', after?.first_name === ktsStudent.first_name);
 
-  section('Local JSON file');
-  await api('POST', '/api/database/sync', sa.token, { data: { payments: [{ id: 'qa-phantom', campusId: 'uk' }] } });
-  const json = readJson('data/ims_database.json');
-  const leaked = ['campuses', 'users', 'teachers', 'classes', 'students', 'payments', 'teacherAttendance', 'studentAttendance', 'auditLogs']
-    .filter((k) => k in json);
-  check('JSON file holds no Supabase-backed data', leaked.length === 0, leaked.length ? `(found: ${leaked.join(', ')})` : '');
+  section('No local storage');
+  const [syncStatus] = await api('POST', '/api/database/sync', sa.token, { data: { payments: [{ id: 'qa-phantom', campusId: 'uk' }] } });
+  check('bulk browser sync is refused', syncStatus === 410, `(HTTP ${syncStatus})`);
+  check('no local JSON data file exists', !fs.existsSync('data/ims_database.json'));
 });

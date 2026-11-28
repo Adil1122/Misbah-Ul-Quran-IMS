@@ -1,6 +1,6 @@
 # Entity-relationship diagram — Misbah-ul-Quran IMS
 
-State after migrations `20261126_01` … `20261126_04`. Column lists show keys and the
+State after migrations `20261126_01` … `20261127_06`. Column lists show keys and the
 fields that matter for relationships; see [SCHEMA.md](SCHEMA.md) for every column.
 
 Labels on each relationship give the `ON DELETE` rule.
@@ -15,6 +15,8 @@ erDiagram
     CAMPUSES ||--o{ USERS : "active_campus_id (SET NULL)"
 
     USERS ||--o| TEACHER_PROFILES : "teacher_id (CASCADE)"
+    USERS ||--o| PARENT_PROFILES : "user_id (CASCADE)"
+    CAMPUSES ||--o{ PARENT_PROFILES : "RESTRICT"
     CAMPUSES ||--o{ TEACHER_PROFILES : "RESTRICT"
 
     CAMPUSES ||--o{ CLASSES : "RESTRICT"
@@ -64,6 +66,13 @@ erDiagram
         text code "unique"
         text timezone
         text currency_code "PKR | GBP"
+    }
+    PARENT_PROFILES {
+        text id PK "par-..."
+        text user_id FK "unique, users.id (role PARENT)"
+        text campus_id FK
+        text phone
+        text cnic_or_id
     }
     TEACHER_PROFILES {
         text id PK "tch-..."
@@ -132,8 +141,11 @@ erDiagram
     DOCUMENTS {
         text id PK
         text campus_id FK
-        text type "teacher | incident | ..."
+        text type "student | teacher | incident"
         text reference_id "polymorphic, no FK"
+        text storage_bucket "misbah-documents (private)"
+        text file_name "object path in the bucket"
+        text uploaded_by FK
     }
     AUDIT_LOGS {
         text id PK
@@ -144,20 +156,84 @@ erDiagram
     }
 ```
 
-## Content and reserved tables
+## Academics, communications, finance and content
 
 ```mermaid
 erDiagram
+    STUDENTS ||--o{ ACADEMIC_PROGRESS : "RESTRICT"
+    CLASSES ||--o{ ACADEMIC_PROGRESS : "RESTRICT"
+    USERS ||--o{ ACADEMIC_PROGRESS : "teacher_id (SET NULL)"
+    STUDENTS ||--o{ EXAM_RESULTS : "RESTRICT"
+    CLASSES ||--o{ EXAM_RESULTS : "RESTRICT"
+    CLASSES ||--o{ TEACHING_MATERIALS : "SET NULL"
+    USERS ||--o{ TEACHING_MATERIALS : "teacher_id (SET NULL)"
+    USERS ||--o{ TEACHER_SALARY_RECORDS : "teacher_id (RESTRICT)"
+    CAMPUSES ||--o{ TEACHER_SALARY_RECORDS : "RESTRICT"
+    CAMPUSES ||--o{ EXPENSE_LOGS : "RESTRICT"
+    USERS ||--o{ EXPENSE_LOGS : "created_by (SET NULL)"
+    CAMPUSES |o--o{ ANNOUNCEMENTS : "RESTRICT (NULL = all campuses)"
+    CAMPUSES ||--o{ EVENT_ANNOUNCEMENTS : "RESTRICT"
+    CLASSES ||--o{ EVENT_ANNOUNCEMENTS : "SET NULL"
+    CAMPUSES |o--o{ NOTIFICATION_LOGS : "RESTRICT"
     CAMPUSES ||--o{ NEWS : "RESTRICT"
     CAMPUSES ||--o{ SLIDER_IMAGES : "RESTRICT"
     CAMPUSES ||--o{ PRAYER_TIMINGS : "RESTRICT"
-    CAMPUSES ||--o{ EXPENSE_LOGS : "RESTRICT"
-    CAMPUSES ||--o{ EVENT_ANNOUNCEMENTS : "RESTRICT"
-    STUDENTS ||--o{ EXAM_RESULTS : "RESTRICT"
-    CLASSES ||--o{ EXAM_RESULTS : "RESTRICT"
-    STUDENTS ||--o{ ACADEMIC_PROGRESS : "RESTRICT"
-    USERS ||--o{ ACADEMIC_PROGRESS : "teacher_id (SET NULL)"
 
+    ACADEMIC_PROGRESS {
+        text id PK
+        text student_id FK
+        text class_id FK
+        text teacher_id FK
+        date date
+        text sabaq_surah
+        int tajweed_score "1-5"
+    }
+    EXAM_RESULTS {
+        text id PK
+        text student_id FK
+        text class_id FK
+        numeric marks_obtained "0..max_marks"
+        numeric max_marks
+    }
+    TEACHING_MATERIALS {
+        text id PK
+        text campus_id FK
+        text class_id FK
+        text teacher_id FK
+        text type "VIDEO | PDF | AUDIO | SYLLABUS"
+    }
+    TEACHER_SALARY_RECORDS {
+        text id PK
+        text teacher_id FK "unique per month"
+        text month_year
+        numeric net_salary
+        text payment_status "PAID | PENDING"
+    }
+    EXPENSE_LOGS {
+        text id PK
+        text campus_id FK
+        text category
+        numeric amount
+    }
+    ANNOUNCEMENTS {
+        text id PK
+        text campus_id FK "NULL = all campuses"
+        text priority "NORMAL | URGENT"
+        text target_role
+    }
+    EVENT_ANNOUNCEMENTS {
+        text id PK
+        text campus_id FK
+        text class_id FK
+        text type "EXAM | COMPETITION | PARENT_MEETING | PAST_EVENT"
+        jsonb reminders_sent
+    }
+    NOTIFICATION_LOGS {
+        text id PK
+        text campus_id FK
+        text recipient_type
+        text channel
+    }
     NEWS {
         int id PK
         text campus_id FK "'all' = global"
@@ -170,29 +246,10 @@ erDiagram
         int id PK
         text campus_id FK
     }
-    EXPENSE_LOGS {
-        text id PK
-        text campus_id FK
-    }
-    EVENT_ANNOUNCEMENTS {
-        text id PK
-        text campus_id FK
-    }
-    EXAM_RESULTS {
-        text id PK
-        text student_id FK
-        text class_id FK
-    }
-    ACADEMIC_PROGRESS {
-        text id PK
-        text student_id FK
-        text teacher_id FK
-    }
 ```
 
 `news`, `slider_images` and `prayer_timings` are public (readable while signed out).
-`expense_logs`, `event_announcements`, `exam_results` and `academic_progress` are reserved:
-the tables exist with keys and RLS, but no app feature writes to them yet.
+Pending admissions have no table: they are students with `approval_status = 'PENDING_APPROVAL'`.
 
 ## Reading the diagram
 

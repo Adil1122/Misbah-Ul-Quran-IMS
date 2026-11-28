@@ -4,7 +4,7 @@
 
 | Layer | What it covers | Who runs it |
 |---|---|---|
-| **Logical JSON backup** (`scripts/backup_supabase.ts`) | Every table and the Supabase Auth user list (no password hashes — Auth never exposes them) | You / before every migration |
+| **Logical backup** (`npm run db:backup`) | Every table, the Supabase Auth user list (no password hashes — Auth never exposes them) and every uploaded file in Storage | You / before every migration |
 | **Supabase platform backups** | Full database, including Auth password hashes | Supabase. Daily backups require a paid plan; Point-in-Time Recovery is a paid add-on. Check **Project Settings → Database → Backups**. |
 | **Schema-level protection** | `RESTRICT` foreign keys, soft delete for students, deactivation for teachers, append-only audit log, RLS | Built into the database |
 
@@ -13,11 +13,12 @@ The free plan has **no** downloadable platform backups, so the logical backup is
 ## Taking a logical backup
 
 ```bash
-npx tsx scripts/backup_supabase.ts
+npm run db:backup
 ```
 
 - Needs `VITE_SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in `.env`.
-- Writes `backups/<timestamp>/<table>.json`, `_auth_users.json` and `_manifest.json` (row counts).
+- Writes `backups/<timestamp>/<table>.json`, `_auth_users.json`, `_storage/<bucket>/<path>` (the uploaded files)
+  and `_manifest.json` (row counts and file counts).
 - Read-only: it changes nothing.
 - `backups/` is git-ignored because it contains personal data. Keep copies somewhere private (encrypted drive or private storage), not in email or chat.
 
@@ -46,11 +47,19 @@ A backup with errors is not complete — fix the cause and run it again.
 ### Whole-database loss
 
 1. Restore from a Supabase platform backup if the plan has one (this also restores Auth password hashes).
-2. Otherwise: recreate the schema (legacy baseline + migrations 01–04), then load each table from the latest logical backup
-   in foreign-key order — `campuses`, `users`, `user_campus_access`, `teacher_profiles`, `classes`, `students`,
-   then attendance, invoices, incidents, medical records, documents, audit logs, content tables.
+2. Otherwise: create a new project and run `supabase/migrations/20261127_00_baseline.sql` there. It creates the full
+   schema and the private `misbah-documents` bucket. Then load each table from the latest logical backup in foreign-key
+   order. That order is `TABLE_ORDER` in `scripts/copy_project_data.ts`: `campuses`, `users`, `user_campus_access`,
+   `parent_profiles`, `teacher_profiles`, `classes`, `students`, then attendance, invoices, incidents, medical records,
+   academic tables, documents, content tables and audit logs.
 3. Auth accounts: recreate them with `auth.admin.createUser` using the ids from `_auth_users.json`, then set each user's
    password through an admin reset (passwords cannot be restored from a logical backup).
+4. Files: upload each file from `_storage/misbah-documents/` to the same path; `documents.file_name` holds that path.
+
+If the old project is still reachable (for example when moving to a new project), use
+`npx tsx scripts/copy_project_data.ts`. It does steps 2–4 automatically from the live old project (set
+`OLD_SUPABASE_URL` / `OLD_SUPABASE_SERVICE_ROLE_KEY`), saves a snapshot first and verifies every row afterwards.
+It writes the temporary passwords only to `backups/<timestamp>_copy/_temporary_passwords.txt`.
 
 ## Secrets
 

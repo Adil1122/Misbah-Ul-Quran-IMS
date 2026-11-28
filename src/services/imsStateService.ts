@@ -61,6 +61,8 @@ import {
 
 export class IMSStateService {
   private static loadPersisted<T>(key: string, fallback: T): T {
+    // Supabase is the only data store: nothing is cached in the browser.
+    if (isSupabaseConfigured) return fallback;
     try {
       if (typeof window !== 'undefined') {
         const data = localStorage.getItem(`misbah_${key}`);
@@ -98,6 +100,7 @@ export class IMSStateService {
   }
 
   private static persist(key: string, data: any): void {
+    if (isSupabaseConfigured) return; // never cache records in the browser
     try {
       if (typeof window !== 'undefined') {
         localStorage.setItem(`misbah_${key}`, JSON.stringify(data));
@@ -247,63 +250,65 @@ export class IMSStateService {
     this.persist('users', this.users);
   }
 
-  private static syncToServer(): void {
-    if (typeof window === 'undefined') return;
-    if (this.syncTimer) clearTimeout(this.syncTimer);
-    this.syncTimer = setTimeout(async () => {
-      try {
-        const token = this.getValidAccessToken();
-        if (!token) {
-          // If no authenticated session or valid access token exists, skip server sync to prevent 401 errors
-          return;
-        }
+  /** Removes data that older versions cached in localStorage (keeps only the session). */
+  private static legacyCacheCleared: boolean = IMSStateService.clearLegacyBrowserCache();
 
-        const res = await fetch('/api/database/sync', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            data: {
-              campuses: this.campuses,
-              students: this.students,
-              teachers: this.teachers,
-              parents: this.parents,
-              classes: this.classes,
-              payments: this.payments,
-              expenses: this.expenses,
-              teacherAttendance: this.teacherAttendance,
-              studentAttendance: this.studentAttendance,
-              academicProgress: this.academicProgress,
-              incidents: this.incidents,
-              announcements: this.announcements,
-              auditLogs: this.auditLogs,
-              salaryRecords: this.salaryRecords,
-              examResults: this.examResults,
-              pendingAdmissions: this.pendingAdmissions,
-              pendingTeachers: this.pendingTeachers,
-              users: this.users,
-            },
-          }),
-        });
+  private static clearLegacyBrowserCache(): boolean {
+    if (typeof window === 'undefined' || !isSupabaseConfigured) return false;
+    try {
+      const keep = new Set(['misbah_current_user']);
+      Object.keys(localStorage)
+        .filter((k) => k.startsWith('misbah_') && !keep.has(k))
+        .forEach((k) => localStorage.removeItem(k));
+    } catch {
+      // ignore
+    }
+    return true;
+  }
 
+  /** Tells the UI that a save failed (App shows a banner). */
+  private static reportSaveError(message: string): void {
+    console.error('[IMSStateService] Save failed:', message);
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('ims:save-error', { detail: { message } }));
+    }
+  }
+
+  /** Saves one record of a Supabase-backed collection (see server/records.ts). */
+  private static persistRecord(collection: string, record: any): void {
+    if (!isSupabaseConfigured) return;
+    fetch(`/api/records/${collection}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+      body: JSON.stringify({ record }),
+    })
+      .then(async (res) => {
         if (!res.ok) {
-          if (res.status === 401) {
-            console.warn('[IMSStateService] Database sync rejected: session token is missing or expired.');
-          } else {
-            console.warn(`[IMSStateService] Database sync returned status ${res.status}.`);
-          }
+          const body = await res.json().catch(() => ({}));
+          this.reportSaveError(body?.error || `Could not save (${res.status}).`);
         }
-      } catch {
-        // network sync errors fail gracefully
-      }
-    }, 250);
+      })
+      .catch(() => this.reportSaveError('Cannot reach the server. Your last change was not saved.'));
+  }
+
+  /** Deletes one record of a Supabase-backed collection. */
+  private static removeRecord(collection: string, id: string): void {
+    if (!isSupabaseConfigured) return;
+    fetch(`/api/records/${collection}/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${this.getValidAccessToken() || ''}` },
+    })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          this.reportSaveError(body?.error || `Could not delete (${res.status}).`);
+        }
+      })
+      .catch(() => this.reportSaveError('Cannot reach the server. The record was not deleted.'));
   }
 
   private static notify(): void {
     this.persistAll();
-    this.syncToServer();
     this.listeners.forEach((l) => l());
   }
 
@@ -324,14 +329,28 @@ export class IMSStateService {
           const json = await serverRes.json();
           if (json && json.data) {
             const d = json.data;
+            const take = <T,>(value: unknown, current: T[]): T[] => (Array.isArray(value) ? (value as T[]) : current);
             if (Array.isArray(d.campuses) && d.campuses.length > 0) this.campuses = d.campuses;
-            if (Array.isArray(d.students) && d.students.length > 0) this.students = d.students;
-            if (Array.isArray(d.teachers) && d.teachers.length > 0) this.teachers = d.teachers;
-            if (Array.isArray(d.parents) && d.parents.length > 0) this.parents = d.parents;
-            if (Array.isArray(d.classes) && d.classes.length > 0) this.classes = d.classes;
-            if (Array.isArray(d.payments) && d.payments.length > 0) this.payments = d.payments;
-            if (Array.isArray(d.teacherAttendance) && d.teacherAttendance.length > 0) this.teacherAttendance = d.teacherAttendance;
-            if (Array.isArray(d.studentAttendance) && d.studentAttendance.length > 0) this.studentAttendance = d.studentAttendance;
+            this.students = take(d.students, this.students);
+            this.teachers = take(d.teachers, this.teachers);
+            this.parents = take(d.parents, this.parents);
+            this.classes = take(d.classes, this.classes);
+            this.payments = take(d.payments, this.payments);
+            this.teacherAttendance = take(d.teacherAttendance, this.teacherAttendance);
+            this.studentAttendance = take(d.studentAttendance, this.studentAttendance);
+            this.incidents = take(d.incidents, this.incidents);
+            this.medicalRecords = take(d.medicalRecords, this.medicalRecords);
+            this.auditLogs = take(d.auditLogs, this.auditLogs);
+            this.expenses = take(d.expenses, this.expenses);
+            this.examResults = take(d.examResults, this.examResults);
+            this.academicProgress = take(d.academicProgress, this.academicProgress);
+            this.announcements = take(d.announcements, this.announcements);
+            this.events = take(d.events, this.events);
+            this.notifications = take(d.notifications, this.notifications);
+            this.teachingMaterials = take(d.teachingMaterials, this.teachingMaterials);
+            this.salaryRecords = take(d.salaryRecords, this.salaryRecords);
+            this.pendingAdmissions = take(d.pendingAdmissions, this.pendingAdmissions);
+            this.pendingTeachers = take(d.pendingTeachers, this.pendingTeachers);
             if (Array.isArray(d.users) && d.users.length > 0) {
               d.users.forEach((u: any) => {
                 const existingIdx = this.users.findIndex((x) => x.id === u.id || x.username === u.username);
@@ -1273,6 +1292,7 @@ export class IMSStateService {
       allowedCampusIds: u.allowedCampusIds || [u.activeCampusId || 'all'],
       activeCampusId: u.activeCampusId || 'all',
       teacherProfileId: u.teacherProfileId,
+      parentProfileId: u.parentProfileId,
       token: body.session.access_token,
     };
     try {
@@ -1418,6 +1438,12 @@ export class IMSStateService {
     }
     this.currentUser = null;
     this.branchImpersonation = { isImpersonating: false, campusId: null };
+    // Nothing from the previous session stays in memory (shared computers).
+    this.students = []; this.teachers = []; this.parents = []; this.classes = []; this.payments = [];
+    this.teacherAttendance = []; this.studentAttendance = []; this.incidents = []; this.medicalRecords = [];
+    this.auditLogs = []; this.expenses = []; this.examResults = []; this.academicProgress = [];
+    this.announcements = []; this.events = []; this.notifications = []; this.teachingMaterials = [];
+    this.salaryRecords = []; this.pendingAdmissions = []; this.pendingTeachers = [];
     this.notify();
   }
 
@@ -2225,11 +2251,15 @@ export class IMSStateService {
       id: record.id || `qprog-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     };
     this.academicProgress = [newRecord, ...this.academicProgress];
+    this.persistRecord('academicProgress', newRecord);
 
     // Update student's quranMilestone record
     const student = this.students.find((s) => s.id === record.studentId);
     if (student && record.sabaqSurah) {
       student.quranMilestone = `${record.sabaqSurah} (${record.sabaqAyah || 'Current Sabaq'})`;
+      this.updateStudent(student.id, { quranMilestone: student.quranMilestone }).then((r) => {
+        if (!r.success) this.reportSaveError(r.error || 'Quran milestone was not saved.');
+      });
     }
 
     this.addAuditLog({
@@ -2265,6 +2295,7 @@ export class IMSStateService {
       id: result.id || `res-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
     };
     this.examResults = [newRecord, ...this.examResults];
+    this.persistRecord('examResults', newRecord);
     this.notify();
     return newRecord;
   }
@@ -2278,6 +2309,7 @@ export class IMSStateService {
       ...previous,
       ...updates,
     };
+    this.persistRecord('examResults', this.examResults[idx]);
 
     this.addAuditLog({
       userId: this.currentUser?.id || 'staff',
@@ -2298,6 +2330,7 @@ export class IMSStateService {
     if (!record) return false;
 
     this.examResults = this.examResults.filter((r) => r.id !== id);
+    this.removeRecord('examResults', id);
 
     this.addAuditLog({
       userId: this.currentUser?.id || 'staff',
@@ -3092,49 +3125,24 @@ export class IMSStateService {
 
   // --- Mutative Operations ---
   static approveStudentAdmission(approvalId: string, assignedOfficialId?: string): boolean {
-    const apprIndex = this.pendingAdmissions.findIndex((a) => a.id === approvalId);
-    if (apprIndex < 0) return false;
-
-    const appr = this.pendingAdmissions[apprIndex];
-    appr.status = 'APPROVED';
-
-    const officialId = assignedOfficialId || `MUQ-${appr.campusId.toUpperCase()}-2026-000${this.students.length + 1}`;
-
-    const newStudent: StudentRecord = {
-      id: appr.studentId,
-      admissionNumber: officialId,
-      campusId: appr.campusId,
-      firstName: appr.studentName.split(' ')[0] || appr.studentName,
-      lastName: appr.studentName.split(' ').slice(1).join(' ') || '',
-      gender: 'MALE',
-      dob: '2014-06-15',
-      enrollmentDate: new Date().toISOString().substring(0, 10),
-      currentGrade: appr.gradeApplying,
-      isActive: true,
-      approvalStatus: 'APPROVED',
-      parentIds: [],
-      primaryParentName: appr.parentName,
-      primaryParentPhone: appr.parentPhone,
-      classId: appr.campusId === 'uk' ? 'cls-uk-01' : 'cls-kts-01',
-      className: appr.campusId === 'uk' ? 'Hifz Al-Quran (Advanced)' : 'Hifz Intensive Morning',
-      attendanceRate: 100,
-      feeStatus: 'UP_TO_DATE',
-      portalAccessActive: true,
-    };
-
-    this.students.unshift(newStudent);
-
+    const appr = this.pendingAdmissions.find((a) => a.id === approvalId);
+    if (!appr) return false;
+    const updates: Partial<StudentRecord> = { approvalStatus: 'APPROVED', isActive: true };
+    if (assignedOfficialId) updates.admissionNumber = assignedOfficialId;
+    this.pendingAdmissions = this.pendingAdmissions.filter((a) => a.id !== approvalId);
+    this.updateStudent(appr.studentId, updates).then((r) => {
+      if (!r.success) this.reportSaveError(r.error || 'Admission approval was not saved.');
+    });
     this.addAuditLog({
       campusId: appr.campusId,
       userId: this.currentUser?.id || 'superadmin',
-      userName: this.currentUser?.fullName || 'Super Admin',
-      userRole: 'SUPER_ADMIN',
-      action: 'STUDENT_ADMISSION_APPROVED',
+      userName: this.currentUser?.fullName || 'Administrator',
+      userRole: this.currentUser?.role || 'SUPER_ADMIN',
+      action: 'ADMISSION_APPROVED',
       entityType: 'Student',
-      entityId: officialId,
-      details: `Super Admin approved student admission for ${appr.studentName}. Assigned official ID: ${officialId}`,
+      entityId: appr.studentId,
+      details: `Approved admission for ${appr.studentName}`,
     });
-
     this.notify();
     return true;
   }
@@ -3142,20 +3150,20 @@ export class IMSStateService {
   static rejectStudentAdmission(approvalId: string, reason: string): boolean {
     const appr = this.pendingAdmissions.find((a) => a.id === approvalId);
     if (!appr) return false;
-    appr.status = 'REJECTED';
-    appr.notes = `Rejected: ${reason}`;
-
+    this.pendingAdmissions = this.pendingAdmissions.filter((a) => a.id !== approvalId);
+    this.updateStudent(appr.studentId, { approvalStatus: 'REJECTED', isActive: false }).then((r) => {
+      if (!r.success) this.reportSaveError(r.error || 'Admission rejection was not saved.');
+    });
     this.addAuditLog({
       campusId: appr.campusId,
       userId: this.currentUser?.id || 'superadmin',
-      userName: this.currentUser?.fullName || 'Super Admin',
-      userRole: 'SUPER_ADMIN',
-      action: 'STUDENT_ADMISSION_REJECTED',
+      userName: this.currentUser?.fullName || 'Administrator',
+      userRole: this.currentUser?.role || 'SUPER_ADMIN',
+      action: 'ADMISSION_REJECTED',
       entityType: 'Student',
       entityId: appr.studentId,
-      details: `Rejected admission for ${appr.studentName}. Reason: ${reason}`,
+      details: `Rejected admission for ${appr.studentName}: ${reason}`,
     });
-
     this.notify();
     return true;
   }
@@ -3208,6 +3216,7 @@ export class IMSStateService {
 
     const previous = { ...this.salaryRecords[idx] };
     this.salaryRecords[idx] = { ...previous, ...updates };
+    this.persistRecord('salaryRecords', this.salaryRecords[idx]);
 
     this.addAuditLog({
       campusId: previous.campusId,
@@ -3251,15 +3260,27 @@ export class IMSStateService {
   }
 
   static toggleUserPortalAccess(targetType: 'STUDENT' | 'TEACHER' | 'PARENT', targetId: string, active: boolean): boolean {
+    const onResult = (r: { success: boolean; message?: string; error?: string }) => {
+      if (!r.success) this.reportSaveError(r.message || r.error || 'Portal access change was not saved.');
+    };
     if (targetType === 'STUDENT') {
       const s = this.students.find((item) => item.id === targetId);
-      if (s) s.portalAccessActive = active;
+      if (s) {
+        s.portalAccessActive = active;
+        this.updateStudent(s.id, { portalAccessActive: active }).then(onResult);
+      }
     } else if (targetType === 'TEACHER') {
       const t = this.teachers.find((item) => item.id === targetId);
-      if (t) t.portalAccessActive = active;
+      if (t) {
+        t.portalAccessActive = active;
+        if (t.userId) this.updateUser(t.userId, { isActive: active }).then(onResult);
+      }
     } else if (targetType === 'PARENT') {
-      const p = this.parents.find((item) => item.id === targetId);
-      if (p) p.portalAccessActive = active;
+      const parent = this.parents.find((item) => item.id === targetId);
+      if (parent) {
+        parent.portalAccessActive = active;
+        if (parent.userId) this.updateUser(parent.userId, { isActive: active }).then(onResult);
+      }
     }
 
     this.addAuditLog({
@@ -3963,6 +3984,7 @@ export class IMSStateService {
     };
 
     this.teachingMaterials.unshift(newMaterial);
+    this.persistRecord('teachingMaterials', newMaterial);
 
     this.addAuditLog({
       campusId: 'uk',
@@ -3997,6 +4019,7 @@ export class IMSStateService {
     };
 
     this.events.unshift(newEvent);
+    this.persistRecord('events', newEvent);
 
     if (sendReminders) {
       this.notifications.unshift({
@@ -4040,6 +4063,7 @@ export class IMSStateService {
       status: 'DELIVERED',
     };
     this.notifications.unshift(notif);
+    this.persistRecord('notifications', notif);
     this.notify();
     return notif;
   }
@@ -4111,6 +4135,7 @@ export class IMSStateService {
     const med = this.medicalRecords.find((m) => m.id === id);
     if (!med) return false;
     med.status = 'APPROVED';
+    this.persistRecord('medicalRecords', med);
     this.notify();
     return true;
   }
@@ -4124,6 +4149,7 @@ export class IMSStateService {
       id: `exp-${Date.now()}`,
     };
     this.expenses.unshift(exp);
+    this.persistRecord('expenses', exp);
 
     this.addAuditLog({
       campusId: data.campusId,
@@ -4222,6 +4248,7 @@ export class IMSStateService {
       publishedAt: new Date().toISOString().replace('T', ' ').slice(0, 19),
     };
     this.announcements.unshift(ann);
+    this.persistRecord('announcements', ann);
 
     this.addAuditLog({
       campusId: data.campusId || undefined,
@@ -4242,6 +4269,7 @@ export class IMSStateService {
     const idx = this.announcements.findIndex((a) => a.id === id);
     if (idx < 0) return false;
     this.announcements[idx] = { ...this.announcements[idx], ...updates };
+    this.persistRecord('announcements', this.announcements[idx]);
     this.addAuditLog({
       campusId: this.announcements[idx].campusId || undefined,
       userId: this.currentUser?.id || 'admin',
@@ -4260,6 +4288,7 @@ export class IMSStateService {
     const idx = this.events.findIndex((e) => e.id === id);
     if (idx < 0) return false;
     this.events[idx] = { ...this.events[idx], ...updates };
+    this.persistRecord('events', this.events[idx]);
     this.addAuditLog({
       campusId: this.events[idx].campusId || undefined,
       userId: this.currentUser?.id || 'admin',

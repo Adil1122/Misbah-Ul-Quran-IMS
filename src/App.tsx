@@ -73,6 +73,22 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
+  // Show a banner whenever a change could not be saved to the database.
+  const [saveError, setSaveError] = useState<string | null>(null);
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onSaveError = (event: Event) => {
+      setSaveError((event as CustomEvent<{ message: string }>).detail?.message || 'A change could not be saved.');
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setSaveError(null), 10000);
+    };
+    window.addEventListener('ims:save-error', onSaveError);
+    return () => {
+      window.removeEventListener('ims:save-error', onSaveError);
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
   // Subscribe to reactive IMS state changes
   useEffect(() => {
     // Initial data hydration from Supabase PostgreSQL
@@ -532,6 +548,27 @@ export default function App() {
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#F9F8F4] text-[#1A231E]">
+      {saveError && (
+        <div
+          role="alert"
+          className="fixed bottom-4 right-4 z-[100] max-w-sm rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-800 shadow-lg"
+        >
+          <div className="flex items-start gap-3">
+            <div>
+              <p className="font-semibold">Not saved</p>
+              <p className="mt-0.5">{saveError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSaveError(null)}
+              className="ml-auto text-red-700 hover:text-red-900"
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        </div>
+      )}
       {/* 1. Left Sidebar Navigation (Accordion for Super Admin) */}
       <Sidebar
         user={user}

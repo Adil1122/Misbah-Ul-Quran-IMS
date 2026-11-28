@@ -25,6 +25,25 @@ disable Row Level Security and grant the public key full access, which would und
 The live schema as of the start of the 2026-11-26 re-architecture is recorded in
 `backups/catalog_snapshot_2026-11-26.csv` (private, git-ignored).
 
+### New projects: `20261127_00_baseline.sql`
+
+**For a new, empty Supabase project, run only [`20261127_00_baseline.sql`](../../supabase/migrations/20261127_00_baseline.sql).**
+It creates the whole schema as it stands after migrations 01–06: every table, constraint, index, function, trigger,
+RLS policy and grant, plus the private `misbah-documents` bucket. **Do not** run 01–06 on top of it.
+It aborts if the tables already exist, and its result table lists expected vs actual counts.
+
+- It was generated from [`supabase/audit/01_generate_schema_ddl.sql`](../../supabase/audit/01_generate_schema_ddl.sql),
+  a read-only query run on the original project. To regenerate: run that query, export CSV, rebuild.
+  In the SQL Editor choose **Run without RLS**. The query only reads; the dashboard offers RLS only because the
+  generated text contains `CREATE TABLE`, and accepting fails with `relation "public" does not exist`.
+- It was tested on a local Postgres set up like Supabase: re-exporting the result gave all 330 statements identical to the source.
+- `20261127_00_baseline_rollback.sql` drops everything again. It refuses to run if any table holds rows.
+- Data is copied with `scripts/copy_project_data.ts` (dry run by default; `--apply`, `--verify`, `--wipe-new`).
+
+**Applied:** 2026-11-28 on the current project `juscjjuifxdrrzxawqfy`. Data, the 4 linked logins (same ids, temporary
+passwords) and files were copied from the original project `njskmffxcmnvifikgffs` and verified row for row.
+The original project was only read, never changed.
+
 ## History
 
 | # | File | Applied | What it does | Code changes shipped with it |
@@ -36,6 +55,8 @@ The live schema as of the start of the 2026-11-26 re-architecture is recorded in
 | 03 | `20261126_03_integrity.sql` | 2026-11-26 | `ON DELETE CASCADE` → `RESTRICT` for campus/student/teacher history; added missing FKs; renamed `document_uplouds` → `documents` and `medical_logs` → `medical_records`; dropped empty `document_uploads`; deactivated duplicate classes; backfilled class codes; unique class code per campus. | Table names updated; student delete = archive (+ audit); teacher delete deactivates when history exists and removes the Auth login otherwise; unsafe `.or()` filters replaced; inactive classes hidden. |
 | 04 | `20261126_04_drop_plaintext_password.sql` | 2026-11-26 | Dropped `users.password`; deactivated the remaining empty duplicate class (KTS B-2, id `2`). | Inserts no longer write a password; removed the invented `'admin123'` from the state mapping. |
 | — | *(code only)* Step 7 | 2026-11-26 | — | Supabase is the single source of truth: the local JSON file no longer stores Supabase-backed data; `/api/database/state` never falls back to stale copies; admin-only + database-verified campus checks on student/class/payment edits; parent and teacher scoping; audit log loaded from Supabase. |
+| 05 | `20261127_05_remaining_entities.sql` | 2026-11-27 | New tables `parent_profiles`, `teacher_salary_records`, `announcements`, `notification_logs`, `teaching_materials`; missing columns + CHECKs on `expense_logs`, `academic_progress`, `exam_results`, `event_announcements`, `documents`; `students.portal_access_active`; private Storage bucket `misbah-documents`; RLS and grants for all of them. | **Supabase-only.** Generic record API (`server/records.ts`, `POST/DELETE /api/records/:collection`); every remaining collection loaded from Supabase; medical records saved to `medical_records`; documents stored in Storage and streamed by the server; parent profiles created with PARENT accounts; admissions approved on the student record; portal access switches real logins. Local JSON file deleted, bulk browser sync removed (`410`), browser no longer caches records, API returns `503` without Supabase, save failures shown in the UI. |
+| 06 | `20261127_06_progress_teacher_nullable.sql` | 2026-11-27 | `academic_progress.teacher_id` allows NULL (its FK is `ON DELETE SET NULL`). | Progress records default the teacher to the signed-in user. |
 
 ## Rolling back
 
